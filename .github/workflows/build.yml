@@ -1,0 +1,104 @@
+name: Build Ryzix ARM64
+
+on:
+  push:
+    branches: [main, dev, "release/**"]
+    paths-ignore: ['**.md']
+  pull_request:
+    branches: [main]
+    paths-ignore: ['**.md']
+  workflow_dispatch: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build:
+    name: Build Ryzix for Android ARM64
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Checkout ──────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── 2. Setup NDK r25c ────────────────────────────────────
+      - name: Setup Android NDK r25c
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r25c
+          add-to-path: true
+
+      # ── 3. Compile Ryzix for Android ARM64 ───────────────────
+      - name: Build Ryzix (ARM64)
+        env:
+          NDK_PATH: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          set -e
+          TOOLCHAIN="$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64"
+          CXX="$TOOLCHAIN/bin/aarch64-linux-android21-clang++"
+          STRIP="$TOOLCHAIN/bin/llvm-strip"
+
+          $CXX \
+            -O2 -DNDEBUG -std=c++17 -Wall \
+            -static-libstdc++ -lm \
+            src/ryzix.cpp -o ryzix
+
+          $STRIP ryzix 2>/dev/null || true
+          cp ryzix libryzix.so
+
+          echo "=== Build info ==="
+          file ryzix
+          echo "Size: $(wc -c < libryzix.so) bytes"
+
+      # ── 4. Verify binary ─────────────────────────────────────
+      - name: Verify binary
+        run: |
+          [ -f libryzix.so ] || { echo "FATAL: Missing libryzix.so"; exit 1; }
+          echo "OK — $(wc -c < libryzix.so) bytes"
+          file libryzix.so
+
+      # ── 5. Upload artifact ───────────────────────────────────
+      - name: Upload libryzix.so
+        uses: actions/upload-artifact@v4
+        with:
+          name: libryzix-arm64-build${{ github.run_number }}
+          path: libryzix.so
+          retention-days: 30
+
+      # ── 6. GitHub Release (main branch only) ─────────────────
+      - name: Create GitHub Release
+        if: >
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+          && github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0-build.${{ github.run_number }}
+          name: "Ryzix v1.0 (Build #${{ github.run_number }})"
+          body: |
+            ## Ryzix Chess Engine — ~200 ELO
+
+            **Branch:** `${{ github.ref_name }}`
+            **Commit:** `${{ github.sha }}`
+            **Target:** Android ARM64 (NDK r25c, API 21+)
+
+            ### A1Chess Integration
+            1. Download `libryzix.so` below
+            2. Place in `app/src/main/jniLibs/arm64-v8a/`
+            3. Update `StockfishEngine.kt`: `LIB_NAME = "libryzix.so"`
+            4. Rebuild the app
+
+            > **Note:** Ryzix is intentionally weak (~200 ELO) for beginner practice.
+          draft: false
+          prerelease: false
+          files: libryzix.so
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
