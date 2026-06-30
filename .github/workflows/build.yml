@@ -48,7 +48,8 @@ jobs:
           STRIP="$TOOLCHAIN/bin/llvm-strip"
 
           $CXX \
-            -O2 -DNDEBUG -std=c++17 -Wall \
+            -O3 -DNDEBUG -std=c++17 \
+            -march=armv8-a -ffast-math -funroll-loops \
             -static-libstdc++ -lm \
             src/ryzix.cpp -o ryzix
 
@@ -84,19 +85,17 @@ jobs:
           tag_name: v1.0-build.${{ github.run_number }}
           name: "Ryzix v1.0 (Build #${{ github.run_number }})"
           body: |
-            ## Ryzix Chess Engine — ~200 ELO
+            ## Ryzix Chess Engine — Max Strength
 
             **Branch:** `${{ github.ref_name }}`
             **Commit:** `${{ github.sha }}`
             **Target:** Android ARM64 (NDK r25c, API 21+)
+            **Optimisation:** -O3 -march=armv8-a -ffast-math
 
-            ### A1Chess Integration
+            ### RyzixChess Integration
             1. Download `libryzix.so` below
             2. Place in `app/src/main/jniLibs/arm64-v8a/`
-            3. Update `StockfishEngine.kt`: `LIB_NAME = "libryzix.so"`
-            4. Rebuild the app
-
-            > **Note:** Ryzix is intentionally weak (~200 ELO) for beginner practice.
+            3. Rebuild the app
           draft: false
           prerelease: false
           files: libryzix.so
