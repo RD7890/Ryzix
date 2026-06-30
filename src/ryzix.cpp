@@ -826,7 +826,7 @@ struct TTEntry {
     uint8_t  bound = BOUND_NONE;
 };
 
-static constexpr size_t TT_SIZE = 1 << 20;  // 1M entries ≈ 16 MB
+static constexpr size_t TT_SIZE = 1 << 22;  // 4M entries ≈ 48 MB — deeper search cache
 static TTEntry TT[TT_SIZE];
 
 static void ttClear() { std::memset(TT, 0, sizeof(TT)); }
