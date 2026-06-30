@@ -859,7 +859,10 @@ static int ttScore(int rawScore, int ply) {
 
 struct SearchState {
     Move killers[MAX_PLY][2];
-    int  history[13][64];
+    int  history[13][64];           // quiet move history [piece][to]
+    int  captureHistory[13][64][13]; // capture history [piece][to][captured]
+    int  counterMove[13][64];        // counter-move table [piece][to]
+    int  staticEval[MAX_PLY];        // static eval at each ply (for "improving" detection)
     long long nodes;
     int  ply;
     bool stop;
@@ -867,10 +870,18 @@ struct SearchState {
     int  timeLimitMs;
 
     void reset() {
-        std::memset(killers, 0, sizeof(killers));
-        std::memset(history, 0, sizeof(history));
+        std::memset(killers,        0, sizeof(killers));
+        std::memset(history,        0, sizeof(history));
+        std::memset(captureHistory, 0, sizeof(captureHistory));
+        std::memset(counterMove,    0, sizeof(counterMove));
+        std::memset(staticEval,     0, sizeof(staticEval));
         nodes = 0; ply = 0; stop = false;
         timeLimitMs = 5000;
+    }
+
+    // Clamp history scores to prevent overflow
+    static int clamp_hist(int v, int limit = 16384) {
+        return std::max(-limit, std::min(limit, v));
     }
 
     bool timeUp() {
@@ -886,27 +897,34 @@ struct SearchState {
 // ================================================================
 
 static int moveOrderScore(const Board& b, Move m, Move ttMove,
-                          const SearchState& ss) {
-    if (m == ttMove) return 2000000;
-    Piece cap = b.sq[m.to()];
+                          const SearchState& ss, Move prevMove) {
+    if (m == ttMove) return 3000000;
+    Piece mover = b.sq[m.from()];
+    Piece cap   = b.sq[m.to()];
+    if (m.mtype() == 2) cap = (b.side == WHITE) ? BP : WP;  // en passant
     if (cap != EMPTY) {
-        // MVV-LVA: victim value - attacker value/10
-        return 1000000 + PIECE_VAL[cap] - PIECE_VAL[b.sq[m.from()]]/10;
+        // MVV-LVA + capture history
+        int mvvlva = 1000000 + PIECE_VAL[cap]*8 - PIECE_VAL[mover];
+        mvvlva += ss.captureHistory[mover][m.to()][(int)typeOf(cap)];
+        return mvvlva;
     }
     if (m.mtype() == 3) return 900000 + m.promo()*100;  // promotion
     if (ss.ply < MAX_PLY) {
         if (m == ss.killers[ss.ply][0]) return 800000;
         if (m == ss.killers[ss.ply][1]) return 799000;
     }
+    // Counter-move bonus
+    if (!prevMove.isNull() && m.data == (uint16_t)ss.counterMove[b.sq[prevMove.from()]][prevMove.to()])
+        return 700000;
     // History heuristic
-    return ss.history[b.sq[m.from()]][m.to()];
+    return ss.history[mover][m.to()];
 }
 
 static void sortMoves(MoveList& ml, const Board& b, Move ttMove,
-                      const SearchState& ss) {
+                      const SearchState& ss, Move prevMove) {
     int scores[256];
     for (int i = 0; i < ml.count; i++)
-        scores[i] = moveOrderScore(b, ml.moves[i], ttMove, ss);
+        scores[i] = moveOrderScore(b, ml.moves[i], ttMove, ss, prevMove);
     // Insertion sort (fast for small arrays)
     for (int i = 1; i < ml.count; i++) {
         Move m  = ml.moves[i]; int s = scores[i]; int j = i-1;
@@ -976,29 +994,31 @@ static int quiesce(Board& b, int alpha, int beta, SearchState& ss) {
 // ================================================================
 
 static int alphaBeta(Board& b, int alpha, int beta, int depth,
-                     bool nullOk, SearchState& ss);
+                     bool nullOk, SearchState& ss, Move prevMove = Move{});
 
 static int alphaBeta(Board& b, int alpha, int beta, int depth,
-                     bool nullOk, SearchState& ss) {
+                     bool nullOk, SearchState& ss, Move prevMove) {
     if (ss.stop || ss.timeUp()) { ss.stop = true; return 0; }
     ss.nodes++;
 
     bool isRoot = (ss.ply == 0);
     bool pvNode = (beta - alpha > 1);
 
-    // Draw detection (fifty-move rule, repetition via simple check)
+    // Draw detection (fifty-move rule)
     if (!isRoot && b.halfMove >= 100) return 0;
 
     // TT probe
     TTEntry* tte = ttProbe(b.hash);
     Move ttMove{};
-    if (tte->key == b.hash && tte->depth >= 0) {
-        ttMove = Move::fromRaw(tte->move);
+    int ttScore_ = 0;
+    bool ttHit = (tte->key == b.hash && tte->depth >= 0);
+    if (ttHit) {
+        ttMove  = Move::fromRaw(tte->move);
+        ttScore_ = ttScore(tte->score, ss.ply);
         if (!pvNode && tte->depth >= depth) {
-            int s = ttScore(tte->score, ss.ply);
-            if (tte->bound == BOUND_EXACT) return s;
-            if (tte->bound == BOUND_LOWER && s >= beta)  return s;
-            if (tte->bound == BOUND_UPPER && s <= alpha) return s;
+            if (tte->bound == BOUND_EXACT) return ttScore_;
+            if (tte->bound == BOUND_LOWER && ttScore_ >= beta)  return ttScore_;
+            if (tte->bound == BOUND_UPPER && ttScore_ <= alpha) return ttScore_;
         }
     }
 
@@ -1007,10 +1027,17 @@ static int alphaBeta(Board& b, int alpha, int beta, int depth,
     bool inCheck = b.inCheck();
     if (inCheck) depth++;  // check extension
 
-    // Null-move pruning
-    // Skip if: in check, no nullOk, zugzwang risk (only pawns + king)
-    if (!inCheck && nullOk && depth >= 3 && !pvNode) {
-        // Count non-pawn, non-king pieces for side to move
+    // Static eval (for futility pruning and improving detection)
+    int staticEv = (ttHit && tte->bound != BOUND_NONE)
+                   ? ttScore_          // use TT score as eval estimate
+                   : evaluate(b);
+    if (ss.ply < MAX_PLY) ss.staticEval[ss.ply] = staticEv;
+
+    // "Improving": are we doing better than 2 plies ago?
+    bool improving = (ss.ply >= 2) && (staticEv > ss.staticEval[ss.ply - 2]);
+
+    // Null-move pruning — skip if in check, zugzwang risk, or PV node
+    if (!inCheck && nullOk && depth >= 3 && !pvNode && staticEv >= beta) {
         int bigPieces = 0;
         Piece myRook  = (b.side==WHITE) ? WR : BR;
         Piece myQueen = (b.side==WHITE) ? WQ : BQ;
@@ -1021,8 +1048,7 @@ static int alphaBeta(Board& b, int alpha, int beta, int depth,
             if (p==myRook||p==myQueen||p==myKnight||p==myBishop) bigPieces++;
         }
         if (bigPieces > 0) {
-            int R = (depth >= 6) ? 3 : 2;
-            // Make null move: just flip side
+            int R = 3 + depth/6;
             b.hash ^= ZSIDE;
             if (b.epSquare != NO_SQ) { b.hash ^= ZEP[fileOf(b.epSquare)]; }
             int savedEp = b.epSquare;
@@ -1037,18 +1063,30 @@ static int alphaBeta(Board& b, int alpha, int beta, int depth,
             b.hash ^= ZSIDE;
 
             if (!ss.stop && nullScore >= beta)
-                return beta;  // null move cutoff
+                return beta;
         }
+    }
+
+    // Futility pruning — at shallow depths, skip quiet moves unlikely to raise alpha
+    bool doFutility = false;
+    int  futilityMargin = 0;
+    if (!inCheck && depth <= 4 && !pvNode) {
+        futilityMargin = 80 * depth;
+        doFutility = (staticEv + futilityMargin <= alpha);
     }
 
     // Generate and sort moves
     MoveList ml; generatePseudoMoves(b, ml);
-    sortMoves(ml, b, ttMove, ss);
+    sortMoves(ml, b, ttMove, ss, prevMove);
 
-    int  bestScore  = -INF;
+    int  bestScore   = -INF;
     Move bestMove{};
-    int  legalCount = 0;
+    int  legalCount  = 0;
     bool raisedAlpha = false;
+
+    // Track quiet moves and captures tried (for history malus)
+    Move quietsTried[64]; int quietCount = 0;
+    Move captsTried[64];  int captCount  = 0;
 
     for (int i = 0; i < ml.count; i++) {
         Move m = ml.moves[i];
@@ -1056,37 +1094,57 @@ static int alphaBeta(Board& b, int alpha, int beta, int depth,
         legalCount++;
         ss.ply++;
 
-        bool isCapture = (b.history[b.ply-1].captured != EMPTY);
-        bool isPromo   = (m.mtype() == 3);
-        bool givesCheck= b.inCheck();
+        bool isCapture  = (b.history[b.ply-1].captured != EMPTY);
+        bool isPromo    = (m.mtype() == 3);
+        bool givesCheck = b.inCheck();
+        Piece moverPiece = b.sq[m.to()];  // after makeMove, piece is at 'to'
+
+        // Futility pruning: skip quiet non-check moves at shallow depth
+        if (doFutility && !isCapture && !isPromo && !givesCheck && legalCount > 1) {
+            ss.ply--;
+            b.unmakeMove(m);
+            continue;
+        }
+
+        // Track for history malus
+        if (!isCapture && !isPromo && quietCount < 64)
+            quietsTried[quietCount++] = m;
+        if (isCapture && captCount < 64)
+            captsTried[captCount++] = m;
 
         int score;
 
         if (legalCount == 1) {
-            // Full-window search on first move
-            score = -alphaBeta(b, -beta, -alpha, depth-1, true, ss);
+            score = -alphaBeta(b, -beta, -alpha, depth-1, true, ss, m);
         } else {
-            // LMR: reduce quiet moves after first few
+            // LMR: reduce quiet moves with low history
             int reduction = 0;
             if (depth >= 3 && legalCount >= 4 && !isCapture && !isPromo
-                && !inCheck && !givesCheck && m != ss.killers[ss.ply-1][0]
+                && !inCheck && !givesCheck
+                && m != ss.killers[ss.ply-1][0]
                 && m != ss.killers[ss.ply-1][1]) {
-                // LMR formula: sqrt approximation
-                reduction = 1;
-                if (depth >= 6 && legalCount >= 8) reduction = 2;
-                if (depth >= 9 && legalCount >= 16) reduction = 3;
+                // Base LMR formula
+                reduction = 1 + (depth >= 5 ? 1 : 0) + (legalCount >= 8 ? 1 : 0)
+                              + (legalCount >= 16 ? 1 : 0);
+                // Adjust for improving: reduce more if not improving
+                if (!improving) reduction++;
+                // Adjust for history: high history → reduce less
+                int hist = ss.history[moverPiece][m.to()];
+                if (hist > 4000) reduction--;
+                else if (hist < -2000) reduction++;
+                // Clamp reduction
+                reduction = std::max(0, std::min(reduction, depth - 2));
             }
 
-            // Null window search with possible reduction
-            score = -alphaBeta(b, -alpha-1, -alpha, depth-1-reduction, true, ss);
+            score = -alphaBeta(b, -alpha-1, -alpha, depth-1-reduction, true, ss, m);
 
-            // Re-search if it beat alpha (and we had reduced)
+            // Re-search at full depth if reduced search beat alpha
             if (score > alpha && reduction > 0)
-                score = -alphaBeta(b, -alpha-1, -alpha, depth-1, true, ss);
+                score = -alphaBeta(b, -alpha-1, -alpha, depth-1, true, ss, m);
 
-            // PV search: full window if still beats alpha
+            // PV re-search with full window
             if (score > alpha && pvNode)
-                score = -alphaBeta(b, -beta, -alpha, depth-1, true, ss);
+                score = -alphaBeta(b, -beta, -alpha, depth-1, true, ss, m);
         }
 
         ss.ply--;
@@ -1102,17 +1160,45 @@ static int alphaBeta(Board& b, int alpha, int beta, int depth,
             alpha = score;
             raisedAlpha = true;
             if (alpha >= beta) {
-                // Beta cutoff — update killers and history
-                if (b.sq[m.to()] == EMPTY) {
+                Piece captured = b.history[b.ply].captured;
+                if (captured == EMPTY && !isPromo) {
+                    // Killer move update
                     if (ss.ply < MAX_PLY) {
                         ss.killers[ss.ply][1] = ss.killers[ss.ply][0];
                         ss.killers[ss.ply][0] = m;
                     }
-                    ss.history[b.sq[m.from()]][m.to()] += depth*depth;
-                    // Decay old history entries to prevent overflow
-                    if (ss.history[b.sq[m.from()]][m.to()] > 1000000)
-                        for (int p=0;p<13;p++) for (int s=0;s<64;s++)
-                            ss.history[p][s] /= 2;
+                    // Counter-move update
+                    if (!prevMove.isNull() && ss.ply > 0) {
+                        Piece prevPiece = b.sq[prevMove.to()];
+                        if ((int)prevPiece < 13)
+                            ss.counterMove[prevPiece][prevMove.to()] = m.data;
+                    }
+                    // History bonus for the cutoff move
+                    int bonus = std::min(depth * depth, 400);
+                    Piece cutter = b.sq[m.from()];
+                    ss.history[cutter][m.to()] = SearchState::clamp_hist(
+                        ss.history[cutter][m.to()] + bonus);
+                    // History malus for quiets that failed
+                    for (int q = 0; q < quietCount - 1; q++) {
+                        Piece qp = b.sq[quietsTried[q].from()];
+                        ss.history[qp][quietsTried[q].to()] = SearchState::clamp_hist(
+                            ss.history[qp][quietsTried[q].to()] - bonus);
+                    }
+                } else if (captured != EMPTY) {
+                    // Capture history bonus
+                    int bonus = std::min(depth * depth, 400);
+                    Piece cutter = b.sq[m.from()];
+                    int captType = (int)typeOf(captured);
+                    ss.captureHistory[cutter][m.to()][captType] = SearchState::clamp_hist(
+                        ss.captureHistory[cutter][m.to()][captType] + bonus);
+                    // Capture history malus for earlier captures
+                    for (int c = 0; c < captCount - 1; c++) {
+                        Piece cp = b.sq[captsTried[c].from()];
+                        Piece cv = b.history[b.ply].captured;
+                        ss.captureHistory[cp][captsTried[c].to()][(int)typeOf(cv)] =
+                            SearchState::clamp_hist(
+                                ss.captureHistory[cp][captsTried[c].to()][(int)typeOf(cv)] - bonus);
+                    }
                 }
                 ttStore(b.hash, m, beta, depth, BOUND_LOWER, ss.ply);
                 return beta;
@@ -1121,7 +1207,7 @@ static int alphaBeta(Board& b, int alpha, int beta, int depth,
     }
 
     if (legalCount == 0) {
-        return inCheck ? (-MATE_SCORE + ss.ply) : 0;  // checkmate or stalemate
+        return inCheck ? (-MATE_SCORE + ss.ply) : 0;
     }
 
     Bound bound = raisedAlpha ? BOUND_EXACT : BOUND_UPPER;
