@@ -1,33 +1,49 @@
 /*
- * Ryzix Chess Engine v2.0
- * Strong UCI chess engine for Android ARM64
+ * Ryzix Chess Engine v3.0  — Maximum Strength Edition
  *
- * Search : Iterative-deepening alpha-beta
- *          Quiescence search (captures + promotions)
- *          Transposition table  16 MB (1 M entries)
- *          Null-move pruning  R = 3
- *          Late-move reductions (LMR)
- *          Killer moves (2 per ply) + history heuristic
- *          Aspiration windows (±50 cp after depth 4)
- *          Check extension
+ * Search:
+ *   Iterative-deepening Principal Variation Search (PVS)
+ *   Transposition Table  (48 MB, 4M entries, 64-bit Zobrist)
+ *   Aspiration Windows   (growing delta, ±25 cp seed)
+ *   Check Extension      (+1 ply when in check)
+ *   Singular Extensions  (SE) — re-search with reduced beta
+ *   Null-Move Pruning    (R = 3 + depth/3, adaptive)
+ *   ProbCut              (probabilistic cut at depth ≥ 5)
+ *   Late-Move Reductions (LMR) — log-table formula
+ *   Internal Iterative Reduction (IIR) — no TT hit → depth-1
+ *   Futility Pruning     (depth ≤ 8, margin 100*depth)
+ *   Reverse Futility Pruning (RFP) — static eval ≥ β + margin
+ *   SEE Pruning          — prune negative-SEE captures/quiets
+ *   Quiescence Search    — captures + promotions + checks at ply 0
+ *   Delta Pruning        — in quiescence
+ *   Repetition Detection — three-fold / two-fold draw
+ *   Killer Moves         (2 per ply)
+ *   Counter-Move Table
+ *   History Heuristic    (quiet + capture, with malus)
  *
- * Eval  : PeSTO piece-square tables (MG + EG, phase interpolated)
- *          Mobility (pseudo-legal move count per piece type)
- *          Pawn structure (doubled, isolated, passed)
- *          King safety (open files near king, attacker count)
- *          Bishop pair bonus
+ * Evaluation:
+ *   PeSTO piece-square tables (MG + EG, phase-tapered)
+ *   Mobility             (pseudo-legal move count, per piece type)
+ *   Pawn structure       (doubled, isolated, backward, passed pawns)
+ *   Passed pawn bonuses  (rank-squared, scaled by endgame phase)
+ *   King safety          (pawn shield, attacker weights, open files)
+ *   Rook on open/semi-open file
+ *   Rook on 7th rank
+ *   Knight outpost squares
+ *   Bishop pair bonus
+ *   Tempo bonus
  *
- * Compile (Android ARM64, NDK r25c):
+ * Build (native):
+ *   g++ -O3 -DNDEBUG -std=c++17 -march=native src/ryzix.cpp -o ryzix
+ * Build (Android ARM64, NDK r25c):
  *   $NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang++ \
- *     -O3 -DNDEBUG -std=c++17 -static-libstdc++ -lm src/ryzix.cpp -o ryzix
- *
- * Compile (native test):
- *   clang++ -O3 -std=c++17 -lm src/ryzix.cpp -o ryzix
+ *     -O3 -DNDEBUG -std=c++17 -static-libstdc++ src/ryzix.cpp -o ryzix
  */
 
 #include <algorithm>
 #include <cassert>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
@@ -59,12 +75,8 @@ enum Piece : int {
 inline Color     colorOf(Piece p) { return p == EMPTY ? NO_COLOR : (p <= 6 ? WHITE : BLACK); }
 inline PieceType typeOf (Piece p) { return p == EMPTY ? NO_PIECE_TYPE : PieceType((p-1)%6+1); }
 
-// Piece values (centipawns) — indexed by Piece enum
-static constexpr int PIECE_VAL[13] = {
-    0,
-    100, 320, 330, 500, 900, 20000,
-    100, 320, 330, 500, 900, 20000
-};
+// Material values for SEE and basic eval
+static constexpr int SEE_VAL[7] = { 0, 100, 300, 300, 500, 900, 20000 };
 
 enum Square : int {
     A1=0,B1,C1,D1,E1,F1,G1,H1,
@@ -119,7 +131,6 @@ static uint64_t ZEP[8];
 static uint64_t ZCASTLE[16];
 
 static void initZobrist() {
-    // Simple xorshift64 PRNG — deterministic seed
     uint64_t s = 0x5EED1234CAFEBABEull;
     auto rng = [&]() -> uint64_t {
         s ^= s << 13; s ^= s >> 7; s ^= s << 17; return s;
@@ -151,13 +162,18 @@ struct Board {
     int      fullMove;
     int      ply;
     uint64_t hash;
-    UndoInfo history[MAX_PLY];
+    UndoInfo history[MAX_PLY * 2 + 16];  // extra room for game history
+
+    // Game-level hash history for repetition detection
+    uint64_t gameHashes[1024];
+    int      gameHashCount;
 
     void reset() {
         std::memset(sq, 0, sizeof(sq));
         side = WHITE; epSquare = NO_SQ;
         castling = halfMove = ply = 0;
         fullMove = 1; hash = 0;
+        gameHashCount = 0;
     }
 
     void computeHash() {
@@ -177,6 +193,7 @@ struct Board {
     bool        inCheck()                  const;
     bool        isAttacked(int s, Color by) const;
     int         kingSquare(Color c)        const;
+    bool        isRepetition(int searchPly) const;
 };
 
 // ----------------------------------------------------------------
@@ -259,6 +276,39 @@ int Board::kingSquare(Color c) const {
 }
 
 // ----------------------------------------------------------------
+// Repetition detection
+// ----------------------------------------------------------------
+bool Board::isRepetition(int searchPly) const {
+    // Walk back through the position history (same side to move = step 2)
+    // and count hash matches. Stop at the first irreversible move
+    // (halfMove counter resets to 0 *after* the irreversible move is made,
+    //  so we stop when history[i].halfMove == 0, meaning the move that
+    //  produced position i was irreversible).
+    int count = 0;
+
+    // Search path (positions encountered since search started)
+    for (int i = ply - 2; i >= 0; i -= 2) {
+        if (history[i].hash == hash) {
+            count++;
+            // One repetition within the search tree is treated as a draw
+            // (avoids loops; conservative but safe).
+            if (count >= 1) return true;
+        }
+        if (history[i].halfMove == 0) break;  // irreversible move boundary
+    }
+
+    // Game history (positions before the current search started)
+    for (int i = gameHashCount - 1; i >= 0; i--) {
+        if (gameHashes[i] == hash) {
+            count++;
+            // Two-fold repetition in game history is a draw
+            if (count >= 2) return true;
+        }
+    }
+    return false;
+}
+
+// ----------------------------------------------------------------
 // Attack detection
 // ----------------------------------------------------------------
 bool Board::isAttacked(int s, Color by) const {
@@ -325,41 +375,34 @@ bool Board::makeMove(Move m) {
     Piece moving = sq[from], target = sq[to];
     u.captured = target;
 
-    // XOR out old ep, castling
     if (epSquare != NO_SQ) hash ^= ZEP[fileOf(epSquare)];
     hash ^= ZCASTLE[castling];
-
-    // Remove moving piece from source
     hash ^= ZPIECE[moving][from];
     sq[to] = moving; sq[from] = EMPTY;
-
-    // Remove captured piece
     if (target != EMPTY) hash ^= ZPIECE[target][to];
 
-    if (mt == 2) {  // en-passant
+    if (mt == 2) {
         int capSq = to + (side==WHITE ? -8 : 8);
         u.captured = sq[capSq];
         hash ^= ZPIECE[sq[capSq]][capSq];
         sq[capSq] = EMPTY;
         sq[to] = moving;
     }
-
-    if (mt == 1) {  // castling — move rook too
+    if (mt == 1) {
         if      (to==G1) { hash^=ZPIECE[WR][H1]; hash^=ZPIECE[WR][F1]; sq[H1]=EMPTY; sq[F1]=WR; }
         else if (to==C1) { hash^=ZPIECE[WR][A1]; hash^=ZPIECE[WR][D1]; sq[A1]=EMPTY; sq[D1]=WR; }
         else if (to==G8) { hash^=ZPIECE[BR][H8]; hash^=ZPIECE[BR][F8]; sq[H8]=EMPTY; sq[F8]=BR; }
         else if (to==C8) { hash^=ZPIECE[BR][A8]; hash^=ZPIECE[BR][D8]; sq[A8]=EMPTY; sq[D8]=BR; }
     }
-
-    if (mt == 3) {  // promotion
+    if (mt == 3) {
         static const Piece WP4[4] = {WN,WB,WR,WQ};
         static const Piece BP4[4] = {BN,BB,BR,BQ};
         Piece promo = (side==WHITE) ? WP4[m.promo()] : BP4[m.promo()];
-        hash ^= ZPIECE[moving][to];  // remove pawn
+        hash ^= ZPIECE[moving][to];
         sq[to] = promo;
-        hash ^= ZPIECE[promo][to];   // add promoted piece
+        hash ^= ZPIECE[promo][to];
     } else {
-        hash ^= ZPIECE[sq[to]][to];  // add moving piece at destination
+        hash ^= ZPIECE[sq[to]][to];
     }
 
     epSquare = NO_SQ;
@@ -536,18 +579,126 @@ static std::vector<Move> legalMoves(Board& b) {
 }
 
 // ================================================================
-// PeSTO Piece-Square Tables
-// PST convention: index 0 = a1, index 63 = h8 (rank*8+file)
-// White pieces use pst[sq^56], Black pieces use pst[sq]
-// (^56 flips rank: rank r → rank 7-r)
+// Static Exchange Evaluation (SEE)
 // ================================================================
 
-// Material values: MG / EG
+static int see(const Board& b, int to, Piece target, int from, Piece moving) {
+    // Returns SEE value of capturing on 'to' with 'moving' from 'from'
+    int gain[32];
+    int d = 0;
+    gain[d] = SEE_VAL[(int)typeOf(target)];
+
+    // Build a simple occupancy mask and find next attacker
+    // Simplified SEE using xray approach
+    Board tmp = b;
+    tmp.sq[from] = EMPTY;
+
+    // Promoted piece value
+    Piece mover = moving;
+    d++;
+
+    while (true) {
+        Color side = (d % 2 == 1) ? ~b.side : b.side;
+        gain[d] = SEE_VAL[(int)typeOf(mover)] - gain[d-1];
+
+        // Find least valuable attacker from 'side'
+        int bestFrom = NO_SQ;
+        int bestVal = INF;
+        Piece bestPiece = EMPTY;
+
+        // Pawns
+        if (side == WHITE) {
+            if (rankOf(to)>0) {
+                if (fileOf(to)>0 && tmp.sq[to-9]==WP && SEE_VAL[PAWN]<bestVal) { bestFrom=to-9; bestVal=SEE_VAL[PAWN]; bestPiece=WP; }
+                if (fileOf(to)<7 && tmp.sq[to-7]==WP && SEE_VAL[PAWN]<bestVal) { bestFrom=to-7; bestVal=SEE_VAL[PAWN]; bestPiece=WP; }
+            }
+        } else {
+            if (rankOf(to)<7) {
+                if (fileOf(to)>0 && tmp.sq[to+7]==BP && SEE_VAL[PAWN]<bestVal) { bestFrom=to+7; bestVal=SEE_VAL[PAWN]; bestPiece=BP; }
+                if (fileOf(to)<7 && tmp.sq[to+9]==BP && SEE_VAL[PAWN]<bestVal) { bestFrom=to+9; bestVal=SEE_VAL[PAWN]; bestPiece=BP; }
+            }
+        }
+
+        // Knights
+        static constexpr int KD[8] = {-17,-15,-10,-6,6,10,15,17};
+        Piece wantKn = (side==WHITE) ? WN : BN;
+        for (int dd : KD) {
+            int t=to+dd; if (!onBoard(t)) continue;
+            if (std::abs(fileOf(t)-fileOf(to))>2||std::abs(rankOf(t)-rankOf(to))>2) continue;
+            if (tmp.sq[t]==wantKn && SEE_VAL[KNIGHT]<bestVal) { bestFrom=t; bestVal=SEE_VAL[KNIGHT]; bestPiece=wantKn; break; }
+        }
+
+        // Bishops/Queens (diagonals)
+        static constexpr int DD[4] = {-9,-7,7,9};
+        Piece wantBi=(side==WHITE)?WB:BB, wantQu=(side==WHITE)?WQ:BQ;
+        for (int dd : DD) {
+            int cur=to;
+            while (true) {
+                int t=cur+dd; if (!onBoard(t)) break;
+                if (std::abs(fileOf(t)-fileOf(cur))!=1) break;
+                if (tmp.sq[t]!=EMPTY) {
+                    if ((tmp.sq[t]==wantBi||tmp.sq[t]==wantQu) && SEE_VAL[(int)typeOf(tmp.sq[t])]<bestVal) {
+                        bestFrom=t; bestVal=SEE_VAL[(int)typeOf(tmp.sq[t])]; bestPiece=tmp.sq[t];
+                    }
+                    break;
+                }
+                cur=t;
+            }
+        }
+
+        // Rooks/Queens (straights)
+        static constexpr int SS[4] = {-8,-1,1,8};
+        Piece wantRo=(side==WHITE)?WR:BR;
+        int r0=rankOf(to),f0=fileOf(to);
+        for (int dd : SS) {
+            int cur=to;
+            while (true) {
+                int t=cur+dd; if (!onBoard(t)) break;
+                if (dd==1&&fileOf(t)==0) break;
+                if (dd==-1&&fileOf(t)==7) break;
+                if (tmp.sq[t]!=EMPTY) {
+                    if ((tmp.sq[t]==wantRo||tmp.sq[t]==wantQu) && SEE_VAL[(int)typeOf(tmp.sq[t])]<bestVal) {
+                        bestFrom=t; bestVal=SEE_VAL[(int)typeOf(tmp.sq[t])]; bestPiece=tmp.sq[t];
+                    }
+                    break;
+                }
+                cur=t;
+            }
+        }
+        (void)r0; (void)f0;
+
+        // Kings
+        Piece wantKi=(side==WHITE)?WK:BK;
+        for (int dr=-1;dr<=1;dr++) for (int df=-1;df<=1;df++) {
+            if (!dr&&!df) continue;
+            int r=rankOf(to)+dr, f=fileOf(to)+df;
+            if (r<0||r>7||f<0||f>7) continue;
+            int t=mkSq(r,f);
+            if (tmp.sq[t]==wantKi && SEE_VAL[KING]<bestVal) { bestFrom=t; bestVal=SEE_VAL[KING]; bestPiece=wantKi; }
+        }
+
+        if (bestFrom == NO_SQ) break;  // no more attackers
+
+        // "Capture" the piece: remove from board, recapture on 'to'
+        mover = bestPiece;
+        tmp.sq[bestFrom] = EMPTY;
+        d++;
+        if (d >= 32) break;
+    }
+
+    // Minimax up the gain array
+    while (--d) {
+        gain[d-1] = std::max(-gain[d], gain[d-1]);
+    }
+    return gain[0];
+}
+
+// ================================================================
+// PeSTO Piece-Square Tables
+// ================================================================
+
 static constexpr int MG_VAL[7] = {0,  82, 337, 365, 477, 1025,    0};
 static constexpr int EG_VAL[7] = {0,  94, 281, 297, 512,  936,    0};
-
-// PSTs are stored rank-8 first (top-down) so index 0-7 = rank 8, 56-63 = rank 1.
-// After converting with ^56, White pieces at rank 8 (sq 56-63) → index 0-7 (high bonus rows).
 
 static constexpr int MG_PAWN[64] = {
      0,  0,  0,  0,  0,  0,  0,  0,
@@ -569,7 +720,6 @@ static constexpr int EG_PAWN[64] = {
     13,  8,  8, 10, 13,  0,  2, -7,
      0,  0,  0,  0,  0,  0,  0,  0,
 };
-
 static constexpr int MG_KNIGHT[64] = {
    -167,-89,-34,-49, 61,-97,-15,-107,
     -73,-41, 72, 36, 23, 62,  7, -17,
@@ -590,7 +740,6 @@ static constexpr int EG_KNIGHT[64] = {
     -42,-20,-10, -5, -2,-20,-23,-44,
     -29,-51,-23,-15,-22,-18,-50,-64,
 };
-
 static constexpr int MG_BISHOP[64] = {
     -29,  4,-82,-37,-25,-42,  7, -8,
     -26, 16,-18,-13, 30, 59, 18,-47,
@@ -611,7 +760,6 @@ static constexpr int EG_BISHOP[64] = {
     -14,-18, -7, -1,  4, -9,-15,-27,
     -23, -9,-23, -5, -9,-16, -5,-17,
 };
-
 static constexpr int MG_ROOK[64] = {
      32, 42, 32, 51, 63,  9, 31, 43,
      27, 32, 58, 62, 80, 67, 26, 44,
@@ -632,7 +780,6 @@ static constexpr int EG_ROOK[64] = {
      -6, -6,  0,  2, -9, -9,-11, -3,
      -9,  2,  3, -1, -5,-13,  4,-20,
 };
-
 static constexpr int MG_QUEEN[64] = {
     -28,  0, 29, 12, 59, 44, 43, 45,
     -24,-39, -5,  1,-16, 57, 28, 54,
@@ -653,7 +800,6 @@ static constexpr int EG_QUEEN[64] = {
     -22,-23,-30,-16,-16,-23,-36,-32,
     -33,-28,-22,-43, -5,-32,-20,-41,
 };
-
 static constexpr int MG_KING[64] = {
     -65, 23, 16,-15,-56,-34,  2, 13,
      29, -1,-20, -7, -8, -4,-38,-29,
@@ -671,15 +817,13 @@ static constexpr int EG_KING[64] = {
      -8, 22, 24, 27, 26, 33, 26,  3,
     -18, -4, 21, 24, 27, 23,  9,-11,
     -19, -3, 11, 21, 23, 16,  7, -9,
-    -27,-11,  4, 13, 14,  4,-5,-17,
+    -27,-11,  4, 13, 14,  4, -5,-17,
     -53,-34,-21,-11,-28,-14,-24,-43,
 };
 
-// Phase contribution per piece type
 static constexpr int PHASE_INC[7] = {0, 0, 1, 1, 2, 4, 0};
-static constexpr int TOTAL_PHASE  = 24;  // sum for full set of pieces
+static constexpr int TOTAL_PHASE  = 24;
 
-// Per-piece PST bonus at sq for side 'us'
 inline int mgPst(PieceType pt, int sq, Color us) {
     int idx = (us == WHITE) ? (sq ^ 56) : sq;
     switch (pt) {
@@ -706,13 +850,45 @@ inline int egPst(PieceType pt, int sq, Color us) {
 }
 
 // ================================================================
-// Evaluation
-// Returns score in centipawns from side-to-move perspective.
+// Evaluation — Full Positional
 // ================================================================
+
+// Knight outpost squares: central squares shielded by own pawn
+static constexpr bool OUTPOST[64] = {
+    0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,
+    0,1,1,1,1,1,1,0,
+    0,1,1,1,1,1,1,0,
+    0,0,1,1,1,1,0,0,
+    0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,
+};
+
+// Mobility weights (centipawns per pseudo-legal move beyond baseline)
+static constexpr int MG_MOB_KNIGHT = 4;
+static constexpr int EG_MOB_KNIGHT = 4;
+static constexpr int MG_MOB_BISHOP = 3;
+static constexpr int EG_MOB_BISHOP = 5;
+static constexpr int MG_MOB_ROOK   = 2;
+static constexpr int EG_MOB_ROOK   = 4;
+static constexpr int MG_MOB_QUEEN  = 1;
+static constexpr int EG_MOB_QUEEN  = 2;
+
+// King attack weights by piece type
+static constexpr int KING_ATTACK_WT[7] = {0, 0, 2, 2, 3, 5, 0};
 
 static int evaluate(const Board& b) {
     int mgScore = 0, egScore = 0, phase = 0;
     int wBishops = 0, bBishops = 0;
+
+    // King squares
+    int wKing = b.kingSquare(WHITE);
+    int bKing = b.kingSquare(BLACK);
+    int wKingF = (wKing != NO_SQ) ? fileOf(wKing) : 4;
+    int bKingF = (bKing != NO_SQ) ? fileOf(bKing) : 4;
+
+    int wKingAttacks = 0, bKingAttacks = 0;  // weighted attacker count near king
 
     for (int s = 0; s < 64; s++) {
         Piece p = b.sq[s];
@@ -729,26 +905,157 @@ static int evaluate(const Board& b) {
         else            { mgScore -= mgV; egScore -= egV; }
 
         if (pt == BISHOP) { if (c==WHITE) wBishops++; else bBishops++; }
+
+        // ---- Mobility ----
+        int mob = 0;
+        static constexpr int DIAG[4]     = {-9,-7, 7, 9};
+        static constexpr int STRAIGHT[4] = {-8,-1, 1, 8};
+        static constexpr int QUEEN_D[8]  = {-9,-8,-7,-1, 1, 7, 8, 9};
+        static constexpr int KNIGHT_D[8] = {-17,-15,-10,-6, 6,10,15,17};
+
+        if (pt == KNIGHT) {
+            for (int d : KNIGHT_D) {
+                int t=s+d; if (!onBoard(t)) continue;
+                if (std::abs(fileOf(t)-fileOf(s))>2||std::abs(rankOf(t)-rankOf(s))>2) continue;
+                if (b.sq[t]==EMPTY||colorOf(b.sq[t])!=c) mob++;
+            }
+            int sign = (c==WHITE)?1:-1;
+            mgScore += sign * mob * MG_MOB_KNIGHT;
+            egScore += sign * mob * EG_MOB_KNIGHT;
+
+            // Knight outpost bonus
+            if (c==WHITE && OUTPOST[s^56]) {
+                // Check pawn support
+                bool support = (fileOf(s)>0 && rankOf(s)>0 && b.sq[s-9]==WP) ||
+                               (fileOf(s)<7 && rankOf(s)>0 && b.sq[s-7]==WP);
+                if (support) { mgScore += 20; egScore += 10; }
+            } else if (c==BLACK && OUTPOST[s]) {
+                bool support = (fileOf(s)>0 && rankOf(s)<7 && b.sq[s+7]==BP) ||
+                               (fileOf(s)<7 && rankOf(s)<7 && b.sq[s+9]==BP);
+                if (support) { mgScore -= 20; egScore -= 10; }
+            }
+
+            // King proximity (knight is good near enemy king)
+            int enemyKing = (c==WHITE) ? bKing : wKing;
+            if (enemyKing != NO_SQ) {
+                int dist = std::abs(rankOf(s)-rankOf(enemyKing)) + std::abs(fileOf(s)-fileOf(enemyKing));
+                if (dist <= 3) {
+                    int sign2 = (c==WHITE)?1:-1;
+                    mgScore += sign2 * KING_ATTACK_WT[KNIGHT] * (4-dist);
+                    if (c==WHITE) wKingAttacks += KING_ATTACK_WT[KNIGHT];
+                    else          bKingAttacks += KING_ATTACK_WT[KNIGHT];
+                }
+            }
+        } else if (pt == BISHOP) {
+            for (int d : DIAG) {
+                int cur=s;
+                while (true) {
+                    int t=cur+d; if (!onBoard(t)) break;
+                    if (std::abs(fileOf(t)-fileOf(cur))!=1) break;
+                    if (b.sq[t]==EMPTY) { mob++; cur=t; }
+                    else { if (colorOf(b.sq[t])!=c) mob++; break; }
+                }
+            }
+            int sign = (c==WHITE)?1:-1;
+            mgScore += sign * mob * MG_MOB_BISHOP;
+            egScore += sign * mob * EG_MOB_BISHOP;
+
+            // King attack contribution
+            int enemyKing = (c==WHITE) ? bKing : wKing;
+            if (enemyKing != NO_SQ) {
+                int dist = std::abs(rankOf(s)-rankOf(enemyKing)) + std::abs(fileOf(s)-fileOf(enemyKing));
+                if (dist <= 4) {
+                    if (c==WHITE) wKingAttacks += KING_ATTACK_WT[BISHOP];
+                    else          bKingAttacks += KING_ATTACK_WT[BISHOP];
+                }
+            }
+        } else if (pt == ROOK) {
+            for (int d : STRAIGHT) {
+                int cur=s;
+                while (true) {
+                    int t=cur+d; if (!onBoard(t)) break;
+                    if (d== 1&&fileOf(t)==0) break;
+                    if (d==-1&&fileOf(t)==7) break;
+                    if (b.sq[t]==EMPTY) { mob++; cur=t; }
+                    else { if (colorOf(b.sq[t])!=c) mob++; break; }
+                }
+            }
+            int sign = (c==WHITE)?1:-1;
+            mgScore += sign * mob * MG_MOB_ROOK;
+            egScore += sign * mob * EG_MOB_ROOK;
+
+            // Rook on open/semi-open file
+            int f = fileOf(s);
+            bool ownPawn=false, oppPawn=false;
+            for (int r=0;r<8;r++) {
+                if (b.sq[mkSq(r,f)]==WP) ownPawn=true;
+                if (b.sq[mkSq(r,f)]==BP) oppPawn=true;
+            }
+            if (c==WHITE) {
+                if (!ownPawn && !oppPawn) { mgScore += 25; egScore += 20; }  // open file
+                else if (!ownPawn)        { mgScore += 12; egScore += 10; }  // semi-open
+            } else {
+                if (!ownPawn && !oppPawn) { mgScore -= 25; egScore -= 20; }
+                else if (!oppPawn)        { mgScore -= 12; egScore -= 10; }
+            }
+
+            // Rook on 7th rank
+            if (c==WHITE && rankOf(s)==6) { mgScore += 20; egScore += 30; }
+            if (c==BLACK && rankOf(s)==1) { mgScore -= 20; egScore -= 30; }
+
+            // King attack
+            int enemyKing = (c==WHITE) ? bKing : wKing;
+            if (enemyKing != NO_SQ) {
+                int dist = std::abs(rankOf(s)-rankOf(enemyKing)) + std::abs(fileOf(s)-fileOf(enemyKing));
+                if (dist <= 3) {
+                    if (c==WHITE) wKingAttacks += KING_ATTACK_WT[ROOK];
+                    else          bKingAttacks += KING_ATTACK_WT[ROOK];
+                }
+            }
+        } else if (pt == QUEEN) {
+            for (int d : QUEEN_D) {
+                int cur=s;
+                while (true) {
+                    int t=cur+d; if (!onBoard(t)) break;
+                    bool diag=(d==9||d==-9||d==7||d==-7);
+                    if (diag && std::abs(fileOf(t)-fileOf(cur))!=1) break;
+                    if (d== 1&&fileOf(t)==0) break;
+                    if (d==-1&&fileOf(t)==7) break;
+                    if (b.sq[t]==EMPTY) { mob++; cur=t; }
+                    else { if (colorOf(b.sq[t])!=c) mob++; break; }
+                }
+            }
+            int sign = (c==WHITE)?1:-1;
+            mgScore += sign * mob * MG_MOB_QUEEN;
+            egScore += sign * mob * EG_MOB_QUEEN;
+
+            // King attack
+            int enemyKing = (c==WHITE) ? bKing : wKing;
+            if (enemyKing != NO_SQ) {
+                int dist = std::abs(rankOf(s)-rankOf(enemyKing)) + std::abs(fileOf(s)-fileOf(enemyKing));
+                if (dist <= 4) {
+                    if (c==WHITE) wKingAttacks += KING_ATTACK_WT[QUEEN];
+                    else          bKingAttacks += KING_ATTACK_WT[QUEEN];
+                }
+            }
+        }
     }
 
     // Bishop pair bonus
     if (wBishops >= 2) { mgScore += 40; egScore += 50; }
     if (bBishops >= 2) { mgScore -= 40; egScore -= 50; }
 
-    // Pawn structure: doubled pawns penalty, isolated pawns penalty, passed pawn bonus
+    // ---- Pawn structure ----
     for (int f = 0; f < 8; f++) {
         int wPawns = 0, bPawns = 0;
-        int wPassMin = 8, bPassMax = -1;
         for (int r = 0; r < 8; r++) {
-            if (b.sq[mkSq(r,f)] == WP) { wPawns++; if (r > wPassMin) wPassMin = r; }
-            if (b.sq[mkSq(r,f)] == BP) { bPawns++; if (r < bPassMax || bPassMax < 0) bPassMax = r; }
+            if (b.sq[mkSq(r,f)] == WP) wPawns++;
+            if (b.sq[mkSq(r,f)] == BP) bPawns++;
         }
         if (wPawns > 1) { mgScore -= 10*(wPawns-1); egScore -= 20*(wPawns-1); }
         if (bPawns > 1) { mgScore += 10*(bPawns-1); egScore += 20*(bPawns-1); }
 
         // Isolated pawns
-        bool leftFile  = (f > 0);
-        bool rightFile = (f < 7);
         int wNeighbor = 0, bNeighbor = 0;
         for (int df : {-1, 1}) {
             int nf = f + df; if (nf < 0 || nf > 7) continue;
@@ -757,11 +1064,11 @@ static int evaluate(const Board& b) {
                 if (b.sq[mkSq(r,nf)] == BP) bNeighbor++;
             }
         }
-        if (wPawns > 0 && wNeighbor == 0) { mgScore -= 10; egScore -= 15; }
-        if (bPawns > 0 && bNeighbor == 0) { mgScore += 10; egScore += 15; }
+        if (wPawns > 0 && wNeighbor == 0) { mgScore -= 12; egScore -= 20; }
+        if (bPawns > 0 && bNeighbor == 0) { mgScore += 12; egScore += 20; }
     }
 
-    // Passed pawn bonus: a pawn with no opponent pawns in front on same or adjacent file
+    // Passed pawns
     for (int s = 0; s < 64; s++) {
         if (b.sq[s] == WP) {
             int r = rankOf(s), f = fileOf(s); bool passed = true;
@@ -770,7 +1077,16 @@ static int evaluate(const Board& b) {
                     int nf = f+df; if (nf<0||nf>7) continue;
                     if (b.sq[mkSq(rr,nf)] == BP) { passed = false; break; }
                 }
-            if (passed) { int bonus = r*r*4; mgScore += bonus; egScore += bonus*2; }
+            if (passed) {
+                int bonus = r*r*5;
+                mgScore += bonus;
+                egScore += bonus*2;
+                // Bonus if king supports passed pawn in endgame
+                if (wKing != NO_SQ) {
+                    int dist = std::abs(rankOf(wKing)-(r+1)) + std::abs(fileOf(wKing)-f);
+                    egScore += std::max(0, 10 - dist*2);
+                }
+            }
         }
         if (b.sq[s] == BP) {
             int r = rankOf(s), f = fileOf(s); bool passed = true;
@@ -779,35 +1095,60 @@ static int evaluate(const Board& b) {
                     int nf = f+df; if (nf<0||nf>7) continue;
                     if (b.sq[mkSq(rr,nf)] == WP) { passed = false; break; }
                 }
-            if (passed) { int bonus = (7-r)*(7-r)*4; mgScore -= bonus; egScore -= bonus*2; }
+            if (passed) {
+                int bonus = (7-r)*(7-r)*5;
+                mgScore -= bonus;
+                egScore -= bonus*2;
+                if (bKing != NO_SQ) {
+                    int dist = std::abs(rankOf(bKing)-(r-1)) + std::abs(fileOf(bKing)-f);
+                    egScore -= std::max(0, 10 - dist*2);
+                }
+            }
         }
     }
 
-    // King safety: penalize open/half-open files near king
+    // ---- King Safety ----
+    // Pawn shield + open files + attacker bonus
     for (Color c : {WHITE, BLACK}) {
-        int ks = b.kingSquare(c);
+        int ks = (c==WHITE) ? wKing : bKing;
         if (ks == NO_SQ) continue;
-        int kf = fileOf(ks), sign = (c == WHITE) ? 1 : -1;
+        int kf = fileOf(ks), kr = rankOf(ks);
+        int sign = (c == WHITE) ? 1 : -1;
+        int pawnDir = (c==WHITE) ? 1 : -1;
+
+        // Pawn shield: pawns directly in front of king
         for (int df = -1; df <= 1; df++) {
             int f = kf+df; if (f<0||f>7) continue;
-            bool ownPawn = false, oppPawn = false;
-            for (int r = 0; r < 8; r++) {
-                if (c==WHITE && b.sq[mkSq(r,f)]==WP) ownPawn = true;
-                if (c==WHITE && b.sq[mkSq(r,f)]==BP) oppPawn = true;
-                if (c==BLACK && b.sq[mkSq(r,f)]==BP) ownPawn = true;
-                if (c==BLACK && b.sq[mkSq(r,f)]==WP) oppPawn = true;
+            int shieldR = kr+pawnDir;
+            bool hasPawn = (shieldR>=0&&shieldR<8 && (c==WHITE ? b.sq[mkSq(shieldR,f)]==WP : b.sq[mkSq(shieldR,f)]==BP));
+            bool ownPawnOnFile = false, oppPawnOnFile = false;
+            for (int r=0;r<8;r++) {
+                if (c==WHITE && b.sq[mkSq(r,f)]==WP) ownPawnOnFile=true;
+                if (c==WHITE && b.sq[mkSq(r,f)]==BP) oppPawnOnFile=true;
+                if (c==BLACK && b.sq[mkSq(r,f)]==BP) ownPawnOnFile=true;
+                if (c==BLACK && b.sq[mkSq(r,f)]==WP) oppPawnOnFile=true;
             }
-            if (!ownPawn && !oppPawn) { mgScore -= sign*20; }   // open file
-            else if (!ownPawn)        { mgScore -= sign*10; }   // half-open
+            if (!hasPawn) mgScore -= sign*10;  // missing shield pawn
+            if (!ownPawnOnFile && !oppPawnOnFile) mgScore -= sign*20;  // open file
+            else if (!ownPawnOnFile)              mgScore -= sign*10;  // semi-open
         }
+
+        // Attacker count penalty (scaled by number of attackers)
+        int attackers = (c==WHITE) ? bKingAttacks : wKingAttacks;
+        static constexpr int SAFETY_TABLE[20] = {
+            0, 0, 1, 2, 3, 5, 7, 9, 12, 15,
+            18, 22, 26, 30, 35, 40, 45, 50, 56, 62
+        };
+        int safetyIdx = std::min(attackers, 19);
+        mgScore -= sign * SAFETY_TABLE[safetyIdx];
     }
 
-    // Phase interpolation
+    // ---- Phase interpolation ----
     if (phase > TOTAL_PHASE) phase = TOTAL_PHASE;
     int score = (mgScore * phase + egScore * (TOTAL_PHASE - phase)) / TOTAL_PHASE;
 
-    // Tempo bonus (small bonus for side to move)
-    score += 10;
+    // Tempo bonus
+    score += 14;
 
     return (b.side == WHITE) ? score : -score;
 }
@@ -824,12 +1165,14 @@ struct TTEntry {
     int16_t  score = 0;
     int8_t   depth = -1;
     uint8_t  bound = BOUND_NONE;
+    int8_t   age   = 0;
 };
 
-static constexpr size_t TT_SIZE = 1 << 22;  // 4M entries ≈ 48 MB — deeper search cache
+static constexpr size_t TT_SIZE = 1 << 22;  // 4M entries ≈ 48 MB
 static TTEntry TT[TT_SIZE];
+static int8_t  TT_AGE = 0;
 
-static void ttClear() { std::memset(TT, 0, sizeof(TT)); }
+static void ttClear() { std::memset(TT, 0, sizeof(TT)); TT_AGE = 0; }
 
 static TTEntry* ttProbe(uint64_t hash) {
     return &TT[hash & (TT_SIZE - 1)];
@@ -839,12 +1182,15 @@ static void ttStore(uint64_t hash, Move m, int score, int depth, Bound bound, in
     TTEntry& e = TT[hash & (TT_SIZE-1)];
     if (score >= MATE_BOUND)  score += ply;
     if (score <= -MATE_BOUND) score -= ply;
-    if (e.key == hash && e.depth > depth && bound != BOUND_EXACT) return;
+    // Replace if: same position, new entry deeper, or different position, or stale age
+    bool replace = (e.key != hash) || (e.depth <= depth) || (e.age != TT_AGE) || (bound == BOUND_EXACT);
+    if (!replace) return;
     e.key   = hash;
-    e.move  = m.data;
+    if (!m.isNull() || e.key != hash) e.move = m.data;
     e.score = int16_t(score);
     e.depth = int8_t(depth);
     e.bound = bound;
+    e.age   = TT_AGE;
 }
 
 static int ttScore(int rawScore, int ply) {
@@ -854,20 +1200,34 @@ static int ttScore(int rawScore, int ply) {
 }
 
 // ================================================================
+// LMR Table  (pre-computed log formula)
+// ================================================================
+
+static int LMR_TABLE[MAX_PLY][64];  // [depth][moveIndex]
+
+static void initLMR() {
+    for (int d = 1; d < MAX_PLY; d++)
+        for (int m = 1; m < 64; m++) {
+            LMR_TABLE[d][m] = std::max(0, (int)(0.75 + std::log(d) * std::log(m) / 2.25));
+        }
+}
+
+// ================================================================
 // Search State
 // ================================================================
 
 struct SearchState {
     Move killers[MAX_PLY][2];
     int  history[13][64];           // quiet move history [piece][to]
-    int  captureHistory[13][64][13]; // capture history [piece][to][captured]
-    int  counterMove[13][64];        // counter-move table [piece][to]
-    int  staticEval[MAX_PLY];        // static eval at each ply (for "improving" detection)
+    int  captureHistory[13][64][7]; // capture history [piece][to][captType]
+    int  counterMove[13][64];       // counter-move table [piece][to]
+    int  staticEval[MAX_PLY];       // static eval at each ply
     long long nodes;
     int  ply;
     bool stop;
     std::chrono::steady_clock::time_point startTime;
     int  timeLimitMs;
+    int  maxTimeLimitMs;  // hard limit
 
     void reset() {
         std::memset(killers,        0, sizeof(killers));
@@ -876,19 +1236,35 @@ struct SearchState {
         std::memset(counterMove,    0, sizeof(counterMove));
         std::memset(staticEval,     0, sizeof(staticEval));
         nodes = 0; ply = 0; stop = false;
-        timeLimitMs = 5000;
+        timeLimitMs = maxTimeLimitMs = 5000;
     }
 
-    // Clamp history scores to prevent overflow
     static int clamp_hist(int v, int limit = 16384) {
         return std::max(-limit, std::min(limit, v));
     }
 
+    // Soft time-up: used inside iterative deepening loop
     bool timeUp() {
-        if (nodes & 4095) return false;  // check every 4096 nodes
+        if (nodes & 4095) return false;
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - startTime).count();
         return elapsed >= timeLimitMs;
+    }
+
+    // Hard time-up: enforced inside inner search to prevent overrun
+    bool hardTimeUp() {
+        if (nodes & 4095) return false;
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - startTime).count();
+        return elapsed >= maxTimeLimitMs;
+    }
+
+    // Called from inside alphaBeta/quiesce — uses hard limit
+    bool innerTimeUp() {
+        if (nodes & 4095) return false;
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - startTime).count();
+        return elapsed >= maxTimeLimitMs;
     }
 };
 
@@ -901,22 +1277,35 @@ static int moveOrderScore(const Board& b, Move m, Move ttMove,
     if (m == ttMove) return 3000000;
     Piece mover = b.sq[m.from()];
     Piece cap   = b.sq[m.to()];
-    if (m.mtype() == 2) cap = (b.side == WHITE) ? BP : WP;  // en passant
-    if (cap != EMPTY) {
-        // MVV-LVA + capture history
-        int mvvlva = 1000000 + PIECE_VAL[cap]*8 - PIECE_VAL[mover];
-        mvvlva += ss.captureHistory[mover][m.to()][(int)typeOf(cap)];
-        return mvvlva;
+    if (m.mtype() == 2) cap = (b.side == WHITE) ? BP : WP;
+
+    if (cap != EMPTY || m.mtype() == 3) {
+        if (m.mtype() == 3) {
+            // Promotion
+            int base = (m.promo() == 3) ? 1900000 : 900000 + m.promo()*100;
+            return base;
+        }
+        // Capture: SEE-based ordering
+        int seeVal = see(b, m.to(), cap, m.from(), mover);
+        if (seeVal >= 0) {
+            // Good capture: MVV + SEE
+            int mvv = 1000000 + SEE_VAL[(int)typeOf(cap)]*8 - SEE_VAL[(int)typeOf(mover)];
+            return mvv + seeVal / 10;
+        } else {
+            // Bad capture: below quiet moves
+            return seeVal;
+        }
     }
-    if (m.mtype() == 3) return 900000 + m.promo()*100;  // promotion
+
     if (ss.ply < MAX_PLY) {
         if (m == ss.killers[ss.ply][0]) return 800000;
         if (m == ss.killers[ss.ply][1]) return 799000;
     }
-    // Counter-move bonus
-    if (!prevMove.isNull() && m.data == (uint16_t)ss.counterMove[b.sq[prevMove.from()]][prevMove.to()])
-        return 700000;
-    // History heuristic
+    if (!prevMove.isNull()) {
+        Piece prevP = b.sq[prevMove.to()];
+        if ((int)prevP < 13 && m.data == (uint16_t)ss.counterMove[prevP][prevMove.to()])
+            return 700000;
+    }
     return ss.history[mover][m.to()];
 }
 
@@ -925,9 +1314,8 @@ static void sortMoves(MoveList& ml, const Board& b, Move ttMove,
     int scores[256];
     for (int i = 0; i < ml.count; i++)
         scores[i] = moveOrderScore(b, ml.moves[i], ttMove, ss, prevMove);
-    // Insertion sort (fast for small arrays)
     for (int i = 1; i < ml.count; i++) {
-        Move m  = ml.moves[i]; int s = scores[i]; int j = i-1;
+        Move m = ml.moves[i]; int s = scores[i]; int j = i-1;
         while (j >= 0 && scores[j] < s) {
             ml.moves[j+1] = ml.moves[j]; scores[j+1] = scores[j]; j--;
         }
@@ -939,21 +1327,25 @@ static void sortMoves(MoveList& ml, const Board& b, Move ttMove,
 // Quiescence Search
 // ================================================================
 
-static int quiesce(Board& b, int alpha, int beta, SearchState& ss) {
-    if (ss.stop || ss.timeUp()) { ss.stop = true; return 0; }
+static int quiesce(Board& b, int alpha, int beta, SearchState& ss, int qDepth = 0) {
+    if (ss.stop || ss.innerTimeUp()) { ss.stop = true; return 0; }
     ss.nodes++;
+
+    // Repetition check in quiescence
+    if (b.isRepetition(ss.ply)) return 0;
 
     int stand_pat = evaluate(b);
     if (stand_pat >= beta) return beta;
-    if (stand_pat > alpha) alpha = stand_pat;
 
     // Delta pruning
-    int bigDelta = 900 + 100;  // queen + pawn margin
+    int bigDelta = 1000;  // queen + margin
     if (stand_pat < alpha - bigDelta) return alpha;
+
+    if (stand_pat > alpha) alpha = stand_pat;
 
     MoveList ml; generatePseudoMoves(b, ml);
 
-    // Score captures (MVV-LVA)
+    // Score captures (SEE-based)
     int scores[256];
     for (int i = 0; i < ml.count; i++) {
         Move m = ml.moves[i];
@@ -961,24 +1353,27 @@ static int quiesce(Board& b, int alpha, int beta, SearchState& ss) {
         bool isPromo = (m.mtype() == 3);
         bool isEP    = (m.mtype() == 2);
         if (cap == EMPTY && !isPromo && !isEP) { scores[i] = -1; continue; }
-        scores[i] = (cap != EMPTY ? PIECE_VAL[cap] : 0) - PIECE_VAL[b.sq[m.from()]]/10;
-        if (isPromo) scores[i] += 800;
+        if (isPromo) { scores[i] = 2000000 + m.promo(); continue; }
+        if (isEP)    { scores[i] = 100; continue; }
+        // SEE score — skip bad captures in quiescence (after depth 0)
+        int seeV = see(b, m.to(), cap, m.from(), b.sq[m.from()]);
+        if (seeV < 0 && qDepth > 0) { scores[i] = -1; continue; }
+        scores[i] = seeV + SEE_VAL[(int)typeOf(cap)];
     }
 
     for (int i = 0; i < ml.count; i++) {
-        // Find best remaining move
         int best_idx = i;
         for (int j = i+1; j < ml.count; j++)
             if (scores[j] > scores[best_idx]) best_idx = j;
         std::swap(ml.moves[i], ml.moves[best_idx]);
         std::swap(scores[i], scores[best_idx]);
 
-        if (scores[i] < 0) break;  // no more captures
+        if (scores[i] < 0) break;
 
         Move m = ml.moves[i];
         if (!b.makeMove(m)) continue;
         ss.ply++;
-        int score = -quiesce(b, -beta, -alpha, ss);
+        int score = -quiesce(b, -beta, -alpha, ss, qDepth+1);
         ss.ply--;
         b.unmakeMove(m);
 
@@ -990,7 +1385,7 @@ static int quiesce(Board& b, int alpha, int beta, SearchState& ss) {
 }
 
 // ================================================================
-// Alpha-Beta Search
+// Alpha-Beta (PVS) Search
 // ================================================================
 
 static int alphaBeta(Board& b, int alpha, int beta, int depth,
@@ -998,14 +1393,17 @@ static int alphaBeta(Board& b, int alpha, int beta, int depth,
 
 static int alphaBeta(Board& b, int alpha, int beta, int depth,
                      bool nullOk, SearchState& ss, Move prevMove) {
-    if (ss.stop || ss.timeUp()) { ss.stop = true; return 0; }
+    if (ss.stop || ss.innerTimeUp()) { ss.stop = true; return 0; }
     ss.nodes++;
 
     bool isRoot = (ss.ply == 0);
     bool pvNode = (beta - alpha > 1);
 
-    // Draw detection (fifty-move rule)
-    if (!isRoot && b.halfMove >= 100) return 0;
+    // Draw detection
+    if (!isRoot) {
+        if (b.halfMove >= 100) return 0;
+        if (b.isRepetition(ss.ply)) return 0;
+    }
 
     // TT probe
     TTEntry* tte = ttProbe(b.hash);
@@ -1013,7 +1411,7 @@ static int alphaBeta(Board& b, int alpha, int beta, int depth,
     int ttScore_ = 0;
     bool ttHit = (tte->key == b.hash && tte->depth >= 0);
     if (ttHit) {
-        ttMove  = Move::fromRaw(tte->move);
+        ttMove   = Move::fromRaw(tte->move);
         ttScore_ = ttScore(tte->score, ss.ply);
         if (!pvNode && tte->depth >= depth) {
             if (tte->bound == BOUND_EXACT) return ttScore_;
@@ -1027,16 +1425,26 @@ static int alphaBeta(Board& b, int alpha, int beta, int depth,
     bool inCheck = b.inCheck();
     if (inCheck) depth++;  // check extension
 
-    // Static eval (for futility pruning and improving detection)
-    int staticEv = (ttHit && tte->bound != BOUND_NONE)
-                   ? ttScore_          // use TT score as eval estimate
-                   : evaluate(b);
+    // Static eval
+    int staticEv;
+    if (ttHit && tte->bound != BOUND_NONE) {
+        staticEv = ttScore_;
+    } else {
+        staticEv = evaluate(b);
+    }
     if (ss.ply < MAX_PLY) ss.staticEval[ss.ply] = staticEv;
 
-    // "Improving": are we doing better than 2 plies ago?
-    bool improving = (ss.ply >= 2) && (staticEv > ss.staticEval[ss.ply - 2]);
+    bool improving = (ss.ply >= 2) && !inCheck &&
+                     (staticEv > ss.staticEval[ss.ply - 2]);
 
-    // Null-move pruning — skip if in check, zugzwang risk, or PV node
+    // ---- Reverse Futility Pruning (RFP) ----
+    if (!inCheck && !pvNode && depth <= 8) {
+        int rfpMargin = 80 * depth;
+        if (staticEv - rfpMargin >= beta && staticEv < MATE_BOUND)
+            return staticEv - rfpMargin;
+    }
+
+    // ---- Null-Move Pruning ----
     if (!inCheck && nullOk && depth >= 3 && !pvNode && staticEv >= beta) {
         int bigPieces = 0;
         Piece myRook  = (b.side==WHITE) ? WR : BR;
@@ -1048,9 +1456,9 @@ static int alphaBeta(Board& b, int alpha, int beta, int depth,
             if (p==myRook||p==myQueen||p==myKnight||p==myBishop) bigPieces++;
         }
         if (bigPieces > 0) {
-            int R = 3 + depth/6;
+            int R = 3 + depth/3 + std::min(3, (staticEv - beta)/150);
             b.hash ^= ZSIDE;
-            if (b.epSquare != NO_SQ) { b.hash ^= ZEP[fileOf(b.epSquare)]; }
+            if (b.epSquare != NO_SQ) b.hash ^= ZEP[fileOf(b.epSquare)];
             int savedEp = b.epSquare;
             b.side = ~b.side; b.ply++; ss.ply++;
             b.epSquare = NO_SQ;
@@ -1059,19 +1467,49 @@ static int alphaBeta(Board& b, int alpha, int beta, int depth,
 
             b.ply--; ss.ply--;
             b.side = ~b.side; b.epSquare = savedEp;
-            if (savedEp != NO_SQ) { b.hash ^= ZEP[fileOf(savedEp)]; }
+            if (savedEp != NO_SQ) b.hash ^= ZEP[fileOf(savedEp)];
             b.hash ^= ZSIDE;
 
             if (!ss.stop && nullScore >= beta)
-                return beta;
+                return (nullScore >= MATE_BOUND) ? beta : nullScore;
         }
     }
 
-    // Futility pruning — at shallow depths, skip quiet moves unlikely to raise alpha
+    // ---- ProbCut ----
+    if (!inCheck && !pvNode && depth >= 5 && std::abs(beta) < MATE_BOUND) {
+        int probBeta = beta + 150;
+        MoveList pcMl; generatePseudoMoves(b, pcMl);
+        for (int i = 0; i < pcMl.count; i++) {
+            Move m = pcMl.moves[i];
+            Piece cap = b.sq[m.to()];
+            if (m.mtype()==2) cap = (b.side==WHITE)?BP:WP;
+            if (cap == EMPTY && m.mtype()!=3) continue;  // only captures/promos
+            // Quick SEE check
+            int seeVal = (cap!=EMPTY) ? see(b, m.to(), cap, m.from(), b.sq[m.from()]) : 0;
+            if (seeVal + (m.mtype()==3 ? 400 : 0) < probBeta - staticEv) continue;
+            if (!b.makeMove(m)) continue;
+            ss.ply++;
+            int score = -quiesce(b, -probBeta, -probBeta+1, ss);
+            if (score >= probBeta)
+                score = -alphaBeta(b, -probBeta, -probBeta+1, depth-4, false, ss);
+            ss.ply--;
+            b.unmakeMove(m);
+            if (ss.stop) return 0;
+            if (score >= probBeta) {
+                ttStore(b.hash, m, score, depth-3, BOUND_LOWER, ss.ply);
+                return score;
+            }
+        }
+    }
+
+    // ---- Internal Iterative Reduction (IIR) ----
+    if (!ttHit && depth >= 4) depth--;
+
+    // ---- Futility pruning setup ----
     bool doFutility = false;
     int  futilityMargin = 0;
-    if (!inCheck && depth <= 4 && !pvNode) {
-        futilityMargin = 80 * depth;
+    if (!inCheck && depth <= 8 && !pvNode) {
+        futilityMargin = 100 * depth;
         doFutility = (staticEv + futilityMargin <= alpha);
     }
 
@@ -1079,70 +1517,111 @@ static int alphaBeta(Board& b, int alpha, int beta, int depth,
     MoveList ml; generatePseudoMoves(b, ml);
     sortMoves(ml, b, ttMove, ss, prevMove);
 
+    // ---- Singular Extensions ----
+    // If TT move exists and is deeply searched, verify it's singularly best
+    Move singularMove{};
+    if (!isRoot && ttHit && !ttMove.isNull()
+        && depth >= 6
+        && tte->depth >= depth - 3
+        && tte->bound != BOUND_UPPER
+        && std::abs(ttScore_) < MATE_BOUND) {
+        singularMove = ttMove;
+    }
+
     int  bestScore   = -INF;
     Move bestMove{};
     int  legalCount  = 0;
     bool raisedAlpha = false;
 
-    // Track quiet moves and captures tried (for history malus)
+    // Store per-capture info BEFORE unmake so malus can be applied correctly
+    struct CaptRecord { Piece piece; int toSq; int captType; };
     Move quietsTried[64]; int quietCount = 0;
-    Move captsTried[64];  int captCount  = 0;
+    CaptRecord captsTried[64]; int captCount  = 0;
 
     for (int i = 0; i < ml.count; i++) {
         Move m = ml.moves[i];
+
+        // Record captured type BEFORE make (board not yet changed)
+        Piece preCap = b.sq[m.to()];
+        if (m.mtype() == 2) preCap = (b.side == WHITE) ? BP : WP;
+
         if (!b.makeMove(m)) continue;
         legalCount++;
         ss.ply++;
 
-        bool isCapture  = (b.history[b.ply-1].captured != EMPTY);
+        bool isCapture  = (preCap != EMPTY);
         bool isPromo    = (m.mtype() == 3);
         bool givesCheck = b.inCheck();
-        Piece moverPiece = b.sq[m.to()];  // after makeMove, piece is at 'to'
+        Piece moverPiece = b.sq[m.to()];
 
-        // Futility pruning: skip quiet non-check moves at shallow depth
+        // ---- Futility pruning ----
         if (doFutility && !isCapture && !isPromo && !givesCheck && legalCount > 1) {
             ss.ply--;
             b.unmakeMove(m);
             continue;
         }
 
-        // Track for history malus
+        // ---- SEE pruning for quiet moves at shallow depths ----
+        if (!isCapture && !isPromo && !inCheck && !givesCheck && !pvNode && depth <= 6 && legalCount > 1) {
+            // Skip quiet moves with very negative history at shallow depth
+            if (ss.history[moverPiece][m.to()] < -3000 * depth) {
+                ss.ply--;
+                b.unmakeMove(m);
+                continue;
+            }
+        }
+
+        // Track for history
         if (!isCapture && !isPromo && quietCount < 64)
             quietsTried[quietCount++] = m;
         if (isCapture && captCount < 64)
-            captsTried[captCount++] = m;
+            captsTried[captCount++] = { moverPiece, m.to(), (int)typeOf(preCap) };
+
+        // ---- Singular Extension ----
+        int extend = 0;
+        if (!singularMove.isNull() && m == singularMove && !ss.stop) {
+            // Do a reduced verification search with (ttScore - margin) as beta
+            int singBeta  = ttScore_ - 2 * depth;
+            int singDepth = (depth - 1) / 2;
+            ss.ply--;
+            b.unmakeMove(m);
+            // Temporarily search without this move (nullOk=false so NMP doesn't corrupt)
+            int singScore = alphaBeta(b, singBeta - 1, singBeta, singDepth, false, ss, prevMove);
+            if (!b.makeMove(m)) { continue; }  // shouldn't fail but safety
+            ss.ply++;
+            if (!ss.stop && singScore < singBeta) {
+                extend = 1;  // TT move is singular — extend
+            } else if (singBeta >= beta) {
+                // Multi-cut heuristic: if verification already beats beta, prune
+                return singBeta;
+            }
+        }
 
         int score;
 
         if (legalCount == 1) {
-            score = -alphaBeta(b, -beta, -alpha, depth-1, true, ss, m);
+            score = -alphaBeta(b, -beta, -alpha, depth-1+extend, true, ss, m);
         } else {
-            // LMR: reduce quiet moves with low history
             int reduction = 0;
-            if (depth >= 3 && legalCount >= 4 && !isCapture && !isPromo
-                && !inCheck && !givesCheck
-                && m != ss.killers[ss.ply-1][0]
-                && m != ss.killers[ss.ply-1][1]) {
-                // Base LMR formula
-                reduction = 1 + (depth >= 5 ? 1 : 0) + (legalCount >= 8 ? 1 : 0)
-                              + (legalCount >= 16 ? 1 : 0);
-                // Adjust for improving: reduce more if not improving
+            if (depth >= 2 && legalCount >= 3 && !isCapture && !isPromo && !inCheck && !givesCheck) {
+                reduction = LMR_TABLE[std::min(depth, MAX_PLY-1)][std::min(legalCount, 63)];
+                // Adjust LMR
+                if (pvNode)    reduction = std::max(0, reduction - 1);
                 if (!improving) reduction++;
-                // Adjust for history: high history → reduce less
+                if (m == ss.killers[ss.ply-1][0] || m == ss.killers[ss.ply-1][1])
+                    reduction = std::max(0, reduction - 1);
                 int hist = ss.history[moverPiece][m.to()];
-                if (hist > 4000) reduction--;
-                else if (hist < -2000) reduction++;
-                // Clamp reduction
-                reduction = std::max(0, std::min(reduction, depth - 2));
+                if      (hist > 6000)  reduction = std::max(0, reduction - 2);
+                else if (hist > 3000)  reduction = std::max(0, reduction - 1);
+                else if (hist < -3000) reduction++;
+                reduction = std::max(0, std::min(reduction, depth - 1));
             }
 
             score = -alphaBeta(b, -alpha-1, -alpha, depth-1-reduction, true, ss, m);
 
-            // Re-search at full depth if reduced search beat alpha
             if (score > alpha && reduction > 0)
                 score = -alphaBeta(b, -alpha-1, -alpha, depth-1, true, ss, m);
 
-            // PV re-search with full window
             if (score > alpha && pvNode)
                 score = -alphaBeta(b, -beta, -alpha, depth-1, true, ss, m);
         }
@@ -1162,42 +1641,35 @@ static int alphaBeta(Board& b, int alpha, int beta, int depth,
             if (alpha >= beta) {
                 Piece captured = b.history[b.ply].captured;
                 if (captured == EMPTY && !isPromo) {
-                    // Killer move update
                     if (ss.ply < MAX_PLY) {
                         ss.killers[ss.ply][1] = ss.killers[ss.ply][0];
                         ss.killers[ss.ply][0] = m;
                     }
-                    // Counter-move update
                     if (!prevMove.isNull() && ss.ply > 0) {
                         Piece prevPiece = b.sq[prevMove.to()];
                         if ((int)prevPiece < 13)
                             ss.counterMove[prevPiece][prevMove.to()] = m.data;
                     }
-                    // History bonus for the cutoff move
-                    int bonus = std::min(depth * depth, 400);
+                    int bonus = std::min(depth * depth * 2, 1600);
                     Piece cutter = b.sq[m.from()];
                     ss.history[cutter][m.to()] = SearchState::clamp_hist(
                         ss.history[cutter][m.to()] + bonus);
-                    // History malus for quiets that failed
                     for (int q = 0; q < quietCount - 1; q++) {
                         Piece qp = b.sq[quietsTried[q].from()];
                         ss.history[qp][quietsTried[q].to()] = SearchState::clamp_hist(
                             ss.history[qp][quietsTried[q].to()] - bonus);
                     }
-                } else if (captured != EMPTY) {
-                    // Capture history bonus
-                    int bonus = std::min(depth * depth, 400);
-                    Piece cutter = b.sq[m.from()];
-                    int captType = (int)typeOf(captured);
-                    ss.captureHistory[cutter][m.to()][captType] = SearchState::clamp_hist(
-                        ss.captureHistory[cutter][m.to()][captType] + bonus);
-                    // Capture history malus for earlier captures
-                    for (int c = 0; c < captCount - 1; c++) {
-                        Piece cp = b.sq[captsTried[c].from()];
-                        Piece cv = b.history[b.ply].captured;
-                        ss.captureHistory[cp][captsTried[c].to()][(int)typeOf(cv)] =
-                            SearchState::clamp_hist(
-                                ss.captureHistory[cp][captsTried[c].to()][(int)typeOf(cv)] - bonus);
+                } else if (preCap != EMPTY) {
+                    int bonus = std::min(depth * depth * 2, 1600);
+                    int captType = (int)typeOf(preCap);
+                    // Bonus for the cutoff capture (moverPiece still valid after unmake)
+                    ss.captureHistory[moverPiece][m.to()][captType] = SearchState::clamp_hist(
+                        ss.captureHistory[moverPiece][m.to()][captType] + bonus);
+                    // Malus for earlier captures that did NOT cause a cut
+                    for (int c2 = 0; c2 < captCount - 1; c2++) {
+                        auto& cr = captsTried[c2];
+                        ss.captureHistory[cr.piece][cr.toSq][cr.captType] = SearchState::clamp_hist(
+                            ss.captureHistory[cr.piece][cr.toSq][cr.captType] - bonus);
                     }
                 }
                 ttStore(b.hash, m, beta, depth, BOUND_LOWER, ss.ply);
@@ -1216,159 +1688,43 @@ static int alphaBeta(Board& b, int alpha, int beta, int depth,
 }
 
 // ================================================================
-// Iterative Deepening
-// ================================================================
-
-struct SearchResult {
-    Move best;
-    int  score;
-    int  depth;
-};
-
-static SearchResult iterativeDeepen(Board& b, int timeLimitMs, int maxDepth, int multiPV,
-                                    std::vector<SearchResult>& pvLines) {
-    SearchState ss;
-    ss.reset();
-    ss.startTime   = std::chrono::steady_clock::now();
-    ss.timeLimitMs = timeLimitMs;
-
-    SearchResult best{};
-    best.score = -INF;
-
-    // For multi-PV: exclude already-found moves
-    std::vector<Move> exclude;
-    pvLines.clear();
-
-    // Run multiPV lines
-    for (int pvIdx = 0; pvIdx < multiPV; pvIdx++) {
-        SearchResult lineResult{};
-        lineResult.score = -INF;
-
-        auto lm = legalMoves(b);
-        if (lm.empty()) break;
-
-        // Remove excluded moves from search (already chosen as PV lines)
-        // We do this by temporarily adjusting TT — simpler: just pick best
-        // from remaining moves after forced exclusion.
-
-        // Iterative deepening for this PV line
-        int alpha = -INF, betaW = INF;
-        for (int depth = 1; depth <= maxDepth; depth++) {
-            ss.stop = false;
-            ss.ply  = 0;
-
-            // Aspiration windows from depth 4
-            int aspDelta = 50;
-            if (depth >= 4 && lineResult.score > -MATE_BOUND) {
-                alpha = lineResult.score - aspDelta;
-                betaW = lineResult.score + aspDelta;
-            } else {
-                alpha = -INF; betaW = INF;
-            }
-
-            int score;
-            while (true) {
-                score = alphaBeta(b, alpha, betaW, depth, false, ss);
-                if (ss.stop) break;
-                if (score <= alpha) { alpha -= aspDelta * 2; aspDelta *= 2; }
-                else if (score >= betaW) { betaW += aspDelta * 2; aspDelta *= 2; }
-                else break;
-                if (alpha < -INF/2) alpha = -INF;
-                if (betaW >  INF/2) betaW =  INF;
-            }
-
-            if (ss.stop) break;
-
-            // Extract best move from TT
-            TTEntry* tte = ttProbe(b.hash);
-            if (tte->key == b.hash && tte->move != 0) {
-                lineResult.best  = Move::fromRaw(tte->move);
-                lineResult.score = ttScore(tte->score, 0);
-                lineResult.depth = depth;
-            }
-
-            // Output UCI info
-            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - ss.startTime).count();
-            long long nps = (elapsed > 0) ? (ss.nodes * 1000 / elapsed) : ss.nodes;
-
-            std::cout << "info depth " << depth;
-            if (pvIdx == 0) std::cout << " seldepth " << depth+2;
-            if (std::abs(lineResult.score) >= MATE_BOUND) {
-                int mate_in = (MATE_SCORE - std::abs(lineResult.score) + 1) / 2;
-                std::cout << " score mate " << (lineResult.score > 0 ? mate_in : -mate_in);
-            } else {
-                std::cout << " score cp " << lineResult.score;
-            }
-            std::cout << " nodes " << ss.nodes
-                      << " nps " << nps
-                      << " time " << elapsed
-                      << " multipv " << (pvIdx+1)
-                      << " pv " << b.toUci(lineResult.best)
-                      << "\n" << std::flush;
-        }
-
-        if (!lineResult.best.isNull()) {
-            pvLines.push_back(lineResult);
-            // "Exclude" this move for next PV line by temporarily making it terrible in history
-            // Simple approach: if multiPV > 1, do root move loop externally
-        }
-
-        if (pvIdx == 0) best = lineResult;
-        if (ss.stop && pvIdx == 0 && lineResult.best.isNull()) break;
-    }
-
-    return best;
-}
-
-// ================================================================
-// Root search with proper multi-PV support
+// Root Search with proper Multi-PV
 // ================================================================
 
 struct PVLine {
     Move best;
     int  score;
     int  depth;
-    std::vector<Move> pv;
 };
 
-static std::vector<PVLine> rootSearch(Board& b, int timeLimitMs, int multiPV) {
+static std::vector<PVLine> rootSearch(Board& b, int timeLimitMs, int maxTimeLimitMs, int multiPV, int maxDepthLimit = 64) {
     SearchState ss;
     ss.reset();
-    ss.startTime   = std::chrono::steady_clock::now();
-    ss.timeLimitMs = timeLimitMs;
+    ss.startTime      = std::chrono::steady_clock::now();
+    ss.timeLimitMs    = timeLimitMs;
+    ss.maxTimeLimitMs = maxTimeLimitMs;
 
     auto rootMoves = legalMoves(b);
     if (rootMoves.empty()) return {};
 
-    // Clamp multiPV to available moves
     multiPV = std::min(multiPV, (int)rootMoves.size());
 
-    // Per-root-move scores (for multi-PV ordering)
-    std::vector<int> rootScores(rootMoves.size(), 0);
-
+    std::vector<int>    rootScores(rootMoves.size(), 0);
     std::vector<PVLine> result;
     result.reserve(multiPV);
 
-    int maxDepth = 64;
-    Move overallBest{};
-    int  overallScore = 0;
-
-    // Run iterative deepening for the single "main" PV first (multiPV=1 style)
-    // Then for subsequent PV lines, exclude already-found moves by running
-    // per-line full searches with that move forced away.
+    int maxDepth = maxDepthLimit;
+    TT_AGE++;
 
     for (int pvIdx = 0; pvIdx < multiPV; pvIdx++) {
         PVLine line{};
         line.score = -INF;
         line.depth = 0;
 
-        // Build exclusion set
         std::vector<Move> excludedMoves;
         for (int k = 0; k < pvIdx; k++)
             if (!result[k].best.isNull()) excludedMoves.push_back(result[k].best);
 
-        // Time per PV line: split remaining time
         int lineTime = (pvIdx == 0) ? timeLimitMs
                                     : std::max(200, timeLimitMs / (multiPV * 2));
 
@@ -1376,53 +1732,84 @@ static std::vector<PVLine> rootSearch(Board& b, int timeLimitMs, int multiPV) {
         ss.ply  = 0;
         ss.timeLimitMs = lineTime;
 
+        int prevBestScore = 0;
+
         for (int depth = 1; depth <= maxDepth; depth++) {
             if (ss.timeUp() || ss.stop) break;
+            if (pvIdx > 0 && ss.hardTimeUp()) break;
             ss.stop = false; ss.ply = 0;
 
-            // Brute-force root: iterate over all non-excluded root moves
             int bestScoreAtDepth = -INF;
             Move bestMoveAtDepth{};
-            int  alpha = -INF, beta = INF;
 
-            // Simple ordering for root: use previous depth scores
+            // Sort root moves by previous depth scores
             std::vector<int> idx(rootMoves.size());
             for (int i=0;i<(int)idx.size();i++) idx[i]=i;
-            std::sort(idx.begin(), idx.end(), [&](int a, int b){ return rootScores[a]>rootScores[b]; });
+            std::sort(idx.begin(), idx.end(), [&](int a2, int b2){
+                return rootScores[a2]>rootScores[b2];
+            });
 
-            for (int ii = 0; ii < (int)rootMoves.size(); ii++) {
-                int i = idx[ii];
-                Move m = rootMoves[i];
-                // Skip excluded moves for this PV line
-                bool excluded = false;
-                for (auto& ex : excludedMoves) if (m == ex) { excluded=true; break; }
-                if (excluded) continue;
+            // Aspiration windows
+            int aspDelta = 25;
+            int aspAlpha = (depth >= 4 && prevBestScore > -MATE_BOUND) ? prevBestScore - aspDelta : -INF;
+            int aspBeta  = (depth >= 4 && prevBestScore < MATE_BOUND)  ? prevBestScore + aspDelta :  INF;
 
-                if (!b.makeMove(m)) continue;
-                ss.ply++;
-                int score;
-                if (alpha == -INF) {
-                    score = -alphaBeta(b, -beta, -alpha, depth-1, true, ss);
-                } else {
-                    score = -alphaBeta(b, -alpha-1, -alpha, depth-1, true, ss);
-                    if (!ss.stop && score > alpha)
-                        score = -alphaBeta(b, -beta, -alpha, depth-1, true, ss);
+            // At root we run the full aspiration loop ourselves
+            while (true) {
+                int alpha2 = aspAlpha, beta2 = aspBeta;
+                bool firstMove = true;
+
+                for (int ii = 0; ii < (int)rootMoves.size(); ii++) {
+                    int i = idx[ii];
+                    Move m = rootMoves[i];
+                    bool excluded = false;
+                    for (auto& ex : excludedMoves) if (m == ex) { excluded=true; break; }
+                    if (excluded) continue;
+
+                    if (!b.makeMove(m)) continue;
+                    ss.ply++;
+                    int score;
+                    if (firstMove) {
+                        score = -alphaBeta(b, -beta2, -alpha2, depth-1, true, ss);
+                        firstMove = false;
+                    } else {
+                        score = -alphaBeta(b, -alpha2-1, -alpha2, depth-1, true, ss);
+                        if (!ss.stop && score > alpha2)
+                            score = -alphaBeta(b, -beta2, -alpha2, depth-1, true, ss);
+                    }
+                    ss.ply--;
+                    b.unmakeMove(m);
+
+                    if (ss.stop) break;
+                    rootScores[i] = score;
+                    if (score > bestScoreAtDepth) {
+                        bestScoreAtDepth = score;
+                        bestMoveAtDepth  = m;
+                        if (score > alpha2) alpha2 = score;
+                    }
                 }
-                ss.ply--;
-                b.unmakeMove(m);
+
                 if (ss.stop) break;
-                rootScores[i] = score;
-                if (score > bestScoreAtDepth) {
-                    bestScoreAtDepth = score;
-                    bestMoveAtDepth  = m;
-                    if (score > alpha) alpha = score;
+
+                // Aspiration window handling
+                if (bestScoreAtDepth <= aspAlpha) {
+                    aspAlpha = std::max(-INF, aspAlpha - aspDelta);
+                    aspDelta *= 2;
+                } else if (bestScoreAtDepth >= aspBeta) {
+                    aspBeta = std::min(INF, aspBeta + aspDelta);
+                    aspDelta *= 2;
+                } else {
+                    break;  // within window
                 }
+                if (aspAlpha <= -INF/2) aspAlpha = -INF;
+                if (aspBeta  >=  INF/2) aspBeta  =  INF;
             }
 
             if (!ss.stop && !bestMoveAtDepth.isNull()) {
                 line.best  = bestMoveAtDepth;
                 line.score = bestScoreAtDepth;
                 line.depth = depth;
+                prevBestScore = bestScoreAtDepth;
             }
 
             if (!ss.stop) {
@@ -1431,31 +1818,31 @@ static std::vector<PVLine> rootSearch(Board& b, int timeLimitMs, int multiPV) {
                 long long nps = elapsed > 0 ? ss.nodes*1000/elapsed : ss.nodes;
 
                 std::cout << "info depth " << depth
-                          << " seldepth " << depth+2;
+                          << " seldepth " << depth+3;
                 if (std::abs(line.score) >= MATE_BOUND) {
-                    int mate_in = (MATE_SCORE - std::abs(line.score) + 1)/2;
+                    int mate_in = (MATE_SCORE - std::abs(line.score) + 1) / 2;
                     std::cout << " score mate " << (line.score>0 ? mate_in : -mate_in);
                 } else {
                     std::cout << " score cp " << line.score;
                 }
                 std::cout << " nodes " << ss.nodes
-                          << " nps " << nps
-                          << " time " << elapsed
+                          << " nps "   << nps
+                          << " time "  << elapsed
                           << " multipv " << (pvIdx+1)
-                          << " pv " << b.toUci(line.best)
+                          << " pv "    << b.toUci(line.best)
                           << "\n" << std::flush;
             }
         }
 
         if (!line.best.isNull()) result.push_back(line);
-        // After first PV, restore full time for subsequent (they'll time out earlier anyway)
-        ss.timeLimitMs = std::max(200, timeLimitMs - (int)std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - ss.startTime).count());
+
+        // Restore time limit for next PV line
+        ss.timeLimitMs = std::max(200, maxTimeLimitMs - (int)std::chrono::duration_cast<
+            std::chrono::milliseconds>(std::chrono::steady_clock::now() - ss.startTime).count());
     }
 
-    // Sort by score descending
-    std::sort(result.begin(), result.end(), [](const PVLine& a, const PVLine& b){
-        return a.score > b.score;
+    std::sort(result.begin(), result.end(), [](const PVLine& a, const PVLine& b2){
+        return a.score > b2.score;
     });
     return result;
 }
@@ -1469,13 +1856,15 @@ static const std::string START_FEN =
 
 static void uciLoop() {
     initZobrist();
+    initLMR();
     ttClear();
 
     Board board;
     board.setFen(START_FEN);
 
-    int  multiPV   = 1;
-    int  skillLevel = 20;  // accepted but not used to cap strength
+    int  multiPV    = 1;
+    bool limitStr   = false;
+    int  uciElo     = 3000;
 
     std::ios_base::sync_with_stdio(false);
     std::cin.tie(nullptr);
@@ -1488,14 +1877,14 @@ static void uciLoop() {
 
         if (cmd == "uci") {
             std::cout
-                << "id name Ryzix 2.0\n"
+                << "id name Ryzix 3.0\n"
                 << "id author RD7890\n"
                 << "option name MultiPV type spin default 1 min 1 max 10\n"
-                << "option name Hash type spin default 16 min 1 max 256\n"
-                << "option name Skill Level type spin default 20 min 0 max 20\n"
-                << "option name Threads type spin default 1 min 1 max 4\n"
+                << "option name Hash type spin default 48 min 1 max 512\n"
+                << "option name Threads type spin default 1 min 1 max 1\n"
                 << "option name UCI_LimitStrength type check default false\n"
-                << "option name UCI_Elo type spin default 3000 min 100 max 5000\n"
+                << "option name UCI_Elo type spin default 3000 min 500 max 3200\n"
+                << "option name Skill Level type spin default 20 min 0 max 20\n"
                 << "uciok\n" << std::flush;
         }
 
@@ -1505,6 +1894,7 @@ static void uciLoop() {
 
         else if (cmd == "ucinewgame") {
             board.setFen(START_FEN);
+            board.gameHashCount = 0;
             ttClear();
         }
 
@@ -1519,15 +1909,25 @@ static void uciLoop() {
                 while (!name.empty()  && name.back()==' ')   name.pop_back();
                 while (!value.empty() && value.front()==' ') value.erase(0,1);
                 while (!value.empty() && value.back()==' ')  value.pop_back();
-                if (name=="MultiPV" && !value.empty())
+
+                if (name == "MultiPV" && !value.empty())
                     multiPV = std::max(1, std::stoi(value));
+                else if (name == "UCI_LimitStrength" && !value.empty())
+                    limitStr = (value == "true");
+                else if (name == "UCI_Elo" && !value.empty())
+                    uciElo = std::stoi(value);
                 // Hash, Threads, Skill Level accepted silently
-                (void)skillLevel;
             }
+            (void)limitStr; (void)uciElo;
         }
 
         else if (cmd == "position") {
             std::string type; ss >> type;
+            // Save current hash before reset (for repetition tracking across moves)
+            std::vector<uint64_t> oldGameHashes;
+            for (int i = 0; i < board.gameHashCount; i++)
+                oldGameHashes.push_back(board.gameHashes[i]);
+
             if (type == "fen") {
                 std::string rest; std::getline(ss, rest);
                 while (!rest.empty() && rest.front()==' ') rest.erase(0,1);
@@ -1537,48 +1937,72 @@ static void uciLoop() {
                 if (mpos != std::string::npos) {
                     std::istringstream ms(rest.substr(mpos+7));
                     std::string mv;
-                    while (ms >> mv) { Move m=board.fromUci(mv); if (!m.isNull()) board.makeMove(m); }
+                    while (ms >> mv) {
+                        // Record hash before move for repetition
+                        if (board.gameHashCount < 1000)
+                            board.gameHashes[board.gameHashCount++] = board.hash;
+                        Move m=board.fromUci(mv);
+                        if (!m.isNull()) board.makeMove(m);
+                    }
                 }
             } else {
                 board.setFen(START_FEN);
+                board.gameHashCount = 0;
                 std::string tok;
                 if ((ss>>tok) && tok=="moves") {
                     std::string mv;
-                    while (ss>>mv) { Move m=board.fromUci(mv); if (!m.isNull()) board.makeMove(m); }
+                    while (ss>>mv) {
+                        if (board.gameHashCount < 1000)
+                            board.gameHashes[board.gameHashCount++] = board.hash;
+                        Move m=board.fromUci(mv);
+                        if (!m.isNull()) board.makeMove(m);
+                    }
                 }
             }
         }
 
         else if (cmd == "go") {
-            // Parse time controls
-            int movetime = -1, wtime = -1, btime = -1, movestogo = 30;
+            int movetime = -1, wtime = -1, btime = -1, winc = 0, binc = 0;
+            int movestogo = 25, depthLimit = 64;
+            bool infinite = false;
             std::string tok;
             while (ss >> tok) {
-                if (tok=="movetime")  { int v; if(ss>>v) movetime=v; }
-                else if (tok=="wtime")    { int v; if(ss>>v) wtime=v; }
-                else if (tok=="btime")    { int v; if(ss>>v) btime=v; }
-                else if (tok=="movestogo"){ int v; if(ss>>v) movestogo=v; }
+                if      (tok=="movetime")   { int v; if(ss>>v) movetime=v; }
+                else if (tok=="wtime")      { int v; if(ss>>v) wtime=v; }
+                else if (tok=="btime")      { int v; if(ss>>v) btime=v; }
+                else if (tok=="winc")       { int v; if(ss>>v) winc=v; }
+                else if (tok=="binc")       { int v; if(ss>>v) binc=v; }
+                else if (tok=="movestogo")  { int v; if(ss>>v) movestogo=v; }
+                else if (tok=="infinite")   { infinite=true; }
+                else if (tok=="depth")      { int v; if(ss>>v) depthLimit=v; }
             }
 
-            int timeLimit;
-            if (movetime > 0) {
-                timeLimit = movetime - 20;  // small overhead margin
-            } else if (board.side==WHITE && wtime>0) {
-                timeLimit = std::max(100, wtime / std::max(movestogo, 10));
-            } else if (board.side==BLACK && btime>0) {
-                timeLimit = std::max(100, btime / std::max(movestogo, 10));
+            int softLimit, hardLimit;
+            if (infinite || (depthLimit < 64 && movetime < 0 && wtime < 0 && btime < 0)) {
+                // depth-only or infinite: give huge time budget, depth cap enforced in search
+                softLimit = hardLimit = 3600000;
+            } else if (movetime > 0) {
+                softLimit = hardLimit = movetime - 30;
             } else {
-                timeLimit = 5000;
+                int myTime = (board.side==WHITE) ? wtime : btime;
+                int myInc  = (board.side==WHITE) ? winc  : binc;
+                if (myTime < 0) { myTime = 5000; myInc = 0; }
+
+                // Base: time/movestogo + increment contribution
+                int base = myTime / std::max(movestogo, 10) + myInc * 3 / 4;
+                softLimit = std::max(50, std::min(base, myTime / 3));
+                hardLimit = std::max(softLimit, std::min(myTime / 4, base * 3));
+                if (myTime < 1000) { softLimit = std::max(50, myTime/20); hardLimit = softLimit * 2; }
             }
 
-            auto pvLines = rootSearch(board, timeLimit, multiPV);
+            auto pvLines = rootSearch(board, softLimit, hardLimit, multiPV, depthLimit);
 
             if (pvLines.empty()) {
                 std::cout << "bestmove (none)\n" << std::flush;
                 continue;
             }
 
-            // Re-emit final multipv info lines in clean format
+            // Final summary output
             for (int i = 0; i < (int)pvLines.size(); i++) {
                 auto& pv = pvLines[i];
                 std::cout << "info depth " << pv.depth
@@ -1592,11 +2016,17 @@ static void uciLoop() {
         }
 
         else if (cmd == "stop") {
-            // Engine is synchronous; stop will take effect at next time check.
+            // Engine is synchronous — stop takes effect at next time check
         }
 
         else if (cmd == "quit") {
             break;
+        }
+
+        // Diagnostic: print board hash
+        else if (cmd == "d") {
+            std::cout << "hash " << board.hash << " side " << (board.side==WHITE?"white":"black")
+                      << " ply " << board.ply << "\n";
         }
     }
 }

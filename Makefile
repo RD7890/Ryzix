@@ -6,8 +6,8 @@
 #   make android            — Android ARM64 via NDK (set NDK_PATH)
 #   make clean
 
-CXX      ?= clang++
-CXXFLAGS  = -O2 -DNDEBUG -std=c++17 -Wall -Wextra
+CXX      ?= g++
+CXXFLAGS  = -O3 -DNDEBUG -std=c++17 -march=native -Wall -Wextra
 LDFLAGS   = -lm
 SRC       = src/ryzix.cpp
 OUT       = ryzix
