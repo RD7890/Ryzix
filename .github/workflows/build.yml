@@ -1,103 +1,100 @@
-name: Build Ryzix ARM64
+name: Build Android Engine
 
 on:
   push:
-    branches: [main, dev, "release/**"]
-    paths-ignore: ['**.md']
+    branches: [main]
   pull_request:
     branches: [main]
-    paths-ignore: ['**.md']
-  workflow_dispatch: {}
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
-permissions:
-  contents: write
-
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   build:
-    name: Build Ryzix for Android ARM64
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
+
+    env:
+      NDK_VERSION: r25c
+      API_LEVEL:   21
+      ABI:         arm64-v8a
 
     steps:
-      # ── 1. Checkout ──────────────────────────────────────────
+      # ── Checkout ────────────────────────────────────────────────
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ── 2. Setup NDK r25c ────────────────────────────────────
-      - name: Setup Android NDK r25c
-        uses: nttld/setup-ndk@v1
-        id: setup-ndk
-        with:
-          ndk-version: r25c
-          add-to-path: true
-
-      # ── 3. Compile Ryzix for Android ARM64 ───────────────────
-      - name: Build Ryzix (ARM64)
-        env:
-          NDK_PATH: ${{ steps.setup-ndk.outputs.ndk-path }}
+      # ── Install Android NDK r25c ─────────────────────────────────
+      - name: Install NDK r25c
         run: |
           set -e
-          TOOLCHAIN="$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64"
-          CXX="$TOOLCHAIN/bin/aarch64-linux-android21-clang++"
-          STRIP="$TOOLCHAIN/bin/llvm-strip"
+          NDK_ZIP="android-ndk-${NDK_VERSION}-linux.zip"
+          NDK_URL="https://dl.google.com/android/repository/${NDK_ZIP}"
+          wget -q "${NDK_URL}" -O "${NDK_ZIP}"
+          unzip -q "${NDK_ZIP}"
+          echo "NDK_ROOT=$(pwd)/android-ndk-${NDK_VERSION}" >> "$GITHUB_ENV"
 
-          $CXX \
+      # ── Cross-compile Ryzix for Android ARM64 ───────────────────
+      - name: Build libryzix.so (ARM64)
+        run: |
+          set -e
+
+          TOOLCHAIN="${NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          CXX="${TOOLCHAIN}/aarch64-linux-android${API_LEVEL}-clang++"
+
+          SRCS="src/position.cpp \
+                src/movegen.cpp  \
+                src/evaluate.cpp \
+                src/tt.cpp       \
+                src/timeman.cpp  \
+                src/movepick.cpp \
+                src/search.cpp   \
+                src/book.cpp     \
+                src/uci.cpp      \
+                src/main.cpp"
+
+          # Build as a plain executable (RyzixEngine.kt runs it via ProcessBuilder)
+          "$CXX" \
             -O3 -DNDEBUG -std=c++17 \
             -march=armv8-a -ffast-math -funroll-loops \
-            -static-libstdc++ -lm \
-            src/ryzix.cpp -o ryzix
+            -static-libstdc++ \
+            -I src \
+            $SRCS \
+            -lm \
+            -o ryzix
 
-          $STRIP ryzix 2>/dev/null || true
-          cp ryzix libryzix.so
+          # Strip debug info to minimise size
+          "${TOOLCHAIN}/llvm-strip" ryzix
 
-          echo "=== Build info ==="
-          file ryzix
-          echo "Size: $(wc -c < libryzix.so) bytes"
+          # Place as libryzix.so in the jniLibs layout expected by the Android app
+          mkdir -p jniLibs/arm64-v8a
+          cp ryzix jniLibs/arm64-v8a/libryzix.so
 
-      # ── 4. Verify binary ─────────────────────────────────────
-      - name: Verify binary
-        run: |
-          [ -f libryzix.so ] || { echo "FATAL: Missing libryzix.so"; exit 1; }
-          echo "OK — $(wc -c < libryzix.so) bytes"
-          file libryzix.so
+          echo "Build successful. Binary size:"
+          ls -lh ryzix jniLibs/arm64-v8a/libryzix.so
 
-      # ── 5. Upload artifact ───────────────────────────────────
+      # ── Upload artifacts ─────────────────────────────────────────
       - name: Upload libryzix.so
         uses: actions/upload-artifact@v4
         with:
-          name: libryzix-arm64-build${{ github.run_number }}
-          path: libryzix.so
-          retention-days: 30
+          name: libryzix-arm64
+          path: jniLibs/arm64-v8a/libryzix.so
 
-      # ── 6. GitHub Release (main branch only) ─────────────────
-      - name: Create GitHub Release
-        if: >
-          (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
-          && github.ref == 'refs/heads/main'
+      # ── Create GitHub Release on main push ───────────────────────
+      - name: Create Release
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.0-build.${{ github.run_number }}
-          name: "Ryzix v1.0 (Build #${{ github.run_number }})"
+          tag_name: build-${{ github.run_number }}
+          name: "Ryzix Engine build #${{ github.run_number }}"
           body: |
-            ## Ryzix Chess Engine — Max Strength
+            Automated build from commit ${{ github.sha }}.
 
-            **Branch:** `${{ github.ref_name }}`
-            **Commit:** `${{ github.sha }}`
-            **Target:** Android ARM64 (NDK r25c, API 21+)
-            **Optimisation:** -O3 -march=armv8-a -ffast-math
+            **Opening personality**
+            - ♙ White: London System (d4 → Nf3 → Bf4 → e3 → Bd3 → c3 → 0-0)
+            - ♟ Black: Caro-Kann Defence vs 1.e4 · QGD setup vs 1.d4
 
-            ### RyzixChess Integration
-            1. Download `libryzix.so` below
-            2. Place in `app/src/main/jniLibs/arm64-v8a/`
-            3. Rebuild the app
-          draft: false
-          prerelease: false
-          files: libryzix.so
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            **Architecture**
+            Multi-file C++ (Stockfish-inspired):
+            `position`, `movegen`, `evaluate`, `tt`, `timeman`,
+            `movepick`, `search`, `book`, `uci`
+
+            **Evaluation**: Classical HCE (PeSTO PSTs · mobility · pawn structure · king safety). No NNUE.
+          files: jniLibs/arm64-v8a/libryzix.so
+          token: ${{ secrets.GITHUB_TOKEN }}

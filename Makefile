@@ -1,34 +1,56 @@
-# Ryzix Chess Engine — Makefile
-# Inspired by Stockfish's Makefile structure
+# ──────────────────────────────────────────────────────────────────
+#  Ryzix Chess Engine — Makefile
 #
-# Usage:
-#   make build              — native Linux/macOS build
-#   make android            — Android ARM64 via NDK (set NDK_PATH)
-#   make clean
+#  Targets:
+#    make            → native Linux build (development / testing)
+#    make android    → Android ARM64 cross-build (requires NDK in PATH)
+#    make clean      → remove binaries
+#    make perft      → run perft-5 smoke test
+# ──────────────────────────────────────────────────────────────────
 
-CXX      ?= g++
-CXXFLAGS  = -O3 -DNDEBUG -std=c++17 -march=native -Wall -Wextra
-LDFLAGS   = -lm
-SRC       = src/ryzix.cpp
-OUT       = ryzix
+# Source files (explicit list — no wildcards)
+SRCS := src/position.cpp \
+        src/movegen.cpp  \
+        src/evaluate.cpp \
+        src/tt.cpp       \
+        src/timeman.cpp  \
+        src/movepick.cpp \
+        src/search.cpp   \
+        src/book.cpp     \
+        src/uci.cpp      \
+        src/main.cpp
 
-.PHONY: build android clean
+# ── Native build ──────────────────────────────────────────────────
+CXX     ?= g++
+CXXFLAGS = -O3 -DNDEBUG -std=c++17 -march=native \
+           -ffast-math -funroll-loops \
+           -Wall -Wno-unused-variable \
+           -I src
 
-# ── Native build ───────────────────────────────────────────────
-build:
-	$(CXX) $(CXXFLAGS) $(SRC) -o $(OUT) $(LDFLAGS)
-	@echo "Built: $(OUT) (native)"
+TARGET  = ryzix
 
-# ── Android ARM64 cross-compile via NDK r25c ──────────────────
-# Usage: make android NDK_PATH=/path/to/ndk
-android:
-	@test -n "$(NDK_PATH)" || (echo "ERROR: NDK_PATH not set"; exit 1)
-	$(eval CXX_A := $(NDK_PATH)/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang++)
-	$(eval STRIP := $(NDK_PATH)/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip)
-	$(CXX_A) $(CXXFLAGS) -static-libstdc++ $(SRC) -o $(OUT) $(LDFLAGS)
-	$(STRIP) $(OUT) 2>/dev/null || true
-	cp $(OUT) libryzix.so
-	@echo "Built: libryzix.so (Android ARM64, $(shell wc -c < libryzix.so) bytes)"
+$(TARGET): $(SRCS)
+	$(CXX) $(CXXFLAGS) $^ -lm -o $@
 
+# ── Android ARM64 cross-build ─────────────────────────────────────
+# Set ANDROID_NDK or have the NDK clang++ on your PATH.
+NDK_CXX ?= aarch64-linux-android21-clang++
+
+android: $(SRCS)
+	$(NDK_CXX) \
+	  -O3 -DNDEBUG -std=c++17 \
+	  -march=armv8-a -ffast-math -funroll-loops \
+	  -static-libstdc++ \
+	  -I src \
+	  $^ \
+	  -lm -o ryzix_android
+
+# ── Perft smoke test ──────────────────────────────────────────────
+perft: $(TARGET)
+	echo "perft 5" | ./$(TARGET)
+
+# ── Clean ─────────────────────────────────────────────────────────
 clean:
-	rm -f $(OUT) libryzix.so
+	rm -f $(TARGET) ryzix_android
+
+.PHONY: android perft clean
